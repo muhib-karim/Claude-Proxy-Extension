@@ -37,6 +37,7 @@ VS Code extension for Antigravity Claude Proxy - real-time quota monitoring, mul
 |------|-------------|--------------|
 | 👤 | Account/Quota | Opens quota popup with all accounts |
 | 💎 Pro | Current model (per-window) | Opens model switcher |
+| ⏹ Disabled | Proxy integration is turned off | Opens model switcher with **Enable Proxy** at the top |
 
 ## Per-Window Model Selection
 
@@ -62,17 +63,34 @@ When you click the account icon:
 3. **Reset Times** - Shows when each account's quota resets
 4. **Open Dashboard** - Quick link to full proxy dashboard
 
+## Proxy Enable / Disable (opt-in auto-start)
+
+The proxy integration is **off by default** so it does not conflict with other tools (such as Antigravity Manager) that use the same port.
+
+- Open the model switcher and choose **Enable Proxy** (or **Disable Proxy**) at the top of the list. The choice is remembered across restarts.
+- When enabled, the extension checks `http://localhost:8080/health` on startup and, if the proxy is down, runs `pm2 restart antigravity-proxy`.
+- Disabling while the proxy is online runs `pm2 stop antigravity-proxy`.
+
+## Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `antigravity.proxyScriptPath` | `""` | Absolute path to the proxy entry script (e.g. `.../Antigravity-Claude-Code-Proxy/src/index.js`). If `pm2 restart antigravity-proxy` fails because the process is not registered yet, the extension runs `pm2 start "<path>" --name antigravity-proxy`. Empty = only `pm2 restart`. User/machine setting only (cannot be set by a workspace). |
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `Antigravity: Switch Model` | Choose a different AI model (saved per-window) |
+| `Antigravity: Switch Model` | Choose a different AI model (saved per-window), or enable/disable the proxy |
+| `Antigravity: Show Quota Info` | Show the quota popup (same as clicking the account icon) |
 | `Antigravity: Open Dashboard` | Open proxy dashboard in browser |
 
 ## Requirements
 
 - Antigravity Proxy running on `localhost:8080`
 - VS Code / Antigravity 1.80.0+
+- Optional: [PM2](https://pm2.keymetrics.io/) with the proxy registered as `antigravity-proxy` for auto-start / enable / disable
+- Signed-in Antigravity account detection uses `wmic`/`netstat` and only works on Windows where `wmic` is still installed (recent Windows 11 builds removed it, so detection is skipped there); on macOS/Linux the rest of the extension works without it
 
 ## Installation
 
@@ -80,9 +98,13 @@ When you click the account icon:
 Search "Antigravity Proxy Status" in extensions marketplace.
 
 ### From VSIX
-```powershell
-antigravity --install-extension claude-proxy-status-4.0.0.vsix
+Build the `.vsix` (see [Development](#development)) or download it from a release, then:
+
+```bash
+code --install-extension claude-proxy-status-4.3.0.vsix
 ```
+
+In the Antigravity IDE the equivalent is `antigravity --install-extension claude-proxy-status-4.3.0.vsix` (not verified on Linux).
 
 ## Advanced Features
 
@@ -92,7 +114,42 @@ antigravity --install-extension claude-proxy-status-4.0.0.vsix
 - **Visual quota bars** - Color-coded (filled/empty blocks) for quick status reading
 - **Instant polling** - 5-second refresh for real-time quota updates
 
+## Development
+
+Plain JavaScript (CommonJS), no runtime dependencies. Entry point: `extension.js`; pure, unit-tested helpers live in `lib/helpers.js`.
+
+Prerequisites: Node.js 22 LTS (the dev tooling needs Node >= 20.19) and npm.
+
+```bash
+npm ci                    # install dev tooling (ESLint, TypeScript checker, vsce, test runner)
+npm run lint              # ESLint
+npm run compile           # type-check the JS against the VS Code 1.80 API (tsc --noEmit via jsconfig.json)
+npm test                  # unit + activation smoke tests (node:test, no VS Code needed)
+npx @vscode/vsce package  # builds claude-proxy-status-<version>.vsix (same as: npm run package)
+```
+
+`npx @vscode/vsce` uses the version pinned in `devDependencies` (3.x). Running an unpinned `npx -y @vscode/vsce` outside the project pulls vsce 4.x, which needs Node >= 22.
+
+### Testing
+
+- `npm test` runs `test/helpers.test.js` (quota maths, parsers, PM2 command building) and `test/extension.test.js`, which activates the extension against a fake `vscode` API and a fake proxy on `localhost:8080`. That test is skipped if port 8080 is already in use.
+- `npm run test:integration` downloads VS Code 1.80.0 into `.vscode-test/` and activates the extension inside it. On a headless Linux machine run it under a virtual display:
+
+  ```bash
+  xvfb-run -a npm run test:integration
+  ```
+
+  (Set `VSCODE_VERSION=stable` to test against the latest VS Code.)
+
+CI (`.github/workflows/ci.yml`) runs lint, type-check, unit tests, the integration test and packaging on every push/PR, and uploads the `.vsix` as an artifact.
+
+### Publishing
+
+`publish.ps1` (Windows PowerShell) packages the extension and publishes it to Open VSX with the `OVSX_TOKEN` from `.env` or the environment. `.env` is git-ignored; never commit tokens. (Not verified on Linux.)
+
 ## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ### v4.0.0
 - **Per-window model selection** - Each window maintains its own model independently

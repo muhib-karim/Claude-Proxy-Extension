@@ -2,3 +2,10 @@ node_modules
 .vscode-test
 *.vsix
 .env
+.env.*
+.secrets
+dist
+out
+build
+coverage
+*.log
