@@ -6,7 +6,7 @@
     "publisher": "ai-dev-2024",
     "repository": {
         "type": "git",
-        "url": "https://github.com/ai-dev-2024/Antigravity-Claude-Code-Proxy"
+        "url": "https://github.com/ai-dev-2024/Claude-Proxy-Extension"
     },
     "icon": "icon.png",
     "license": "MIT",
@@ -28,6 +28,13 @@
         "onStartupFinished"
     ],
     "main": "./extension.js",
+    "scripts": {
+        "compile": "tsc -p ./jsconfig.json",
+        "lint": "eslint .",
+        "test": "node --test test/helpers.test.js test/extension.test.js",
+        "test:integration": "node test/integration/runTest.js",
+        "package": "vsce package"
+    },
     "contributes": {
         "commands": [
             {
@@ -42,6 +49,27 @@
                 "command": "antigravity.showQuotaInfo",
                 "title": "Antigravity: Show Quota Info"
             }
-        ]
+        ],
+        "configuration": {
+            "title": "Antigravity Proxy Status",
+            "properties": {
+                "antigravity.proxyScriptPath": {
+                    "type": "string",
+                    "default": "",
+                    "scope": "machine",
+                    "markdownDescription": "Absolute path to the proxy entry script (for example `.../Antigravity-Claude-Code-Proxy/src/index.js`). Used for `pm2 start <path> --name antigravity-proxy` when `pm2 restart antigravity-proxy` fails because the process is not registered with PM2 yet. Leave empty to only use `pm2 restart`."
+                }
+            }
+        }
+    },
+    "devDependencies": {
+        "@eslint/js": "^10.0.1",
+        "@types/node": "^20.19.43",
+        "@types/vscode": "~1.80.0",
+        "@vscode/test-electron": "^2.5.2",
+        "@vscode/vsce": "^3.9.2",
+        "eslint": "^10.11.0",
+        "globals": "^17.12.0",
+        "typescript": "~5.9"
     }
 }

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run compile
+      - run: npm test
+
+      - name: Cache VS Code test build
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test
+          key: vscode-test-1.80.0-${{ runner.os }}
+
+      - name: Integration test (real VS Code, headless)
+        run: xvfb-run -a npm run test:integration
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: '*.vsix'

@@ -4,6 +4,54 @@ All notable changes to the VS Code extension will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Per-window session ID**: the window ID sent to the proxy's `/session-model` endpoint is now stored in `workspaceState`; it was stored in `globalState`, which is shared by all windows, so every window used the same proxy session
+- **Hardcoded proxy path removed**: the offline "start proxy" fallback no longer uses a machine-specific `~/Desktop/Projects/...` path; `pm2 start` is only attempted when the new `antigravity.proxyScriptPath` setting is configured
+- **Timer leak**: the 60-second account refresh interval is now cleared on deactivate
+- **Model switch errors** are shown as an error message instead of an unhandled promise rejection
+- **Quota bar crash**: out-of-range quota values (e.g. >100%) no longer throw a `RangeError`
+- **Account detection**: skipped on non-Windows platforms (it relies on `wmic`/`netstat`); the HTTP fallback request now has a timeout; ports are matched to the exact language server PID; `wmic` records with `\r\r\n` line endings are parsed separately (previously only the last process was checked); overlapping lookups are prevented
+- Activation log shows the real extension version instead of a stale hardcoded one
+- Per-account reset times in the quota popup now belong to the model with the lowest remaining quota (previously the last model listed)
+- `repository` URL in `package.json` now points to this repository, so README images resolve on the marketplace
+- Stale extracted VSIX folders (`extracted-3.3.0/`, `extracted-3.4.0/`) and `publish.ps1` are no longer shipped inside the `.vsix`
+- Local secret files (`.env`, `.env.*`, `.secrets`) are excluded from both git and the `.vsix`
+
+### Added
+- `antigravity.proxyScriptPath` setting (machine scope)
+- Development tooling: `npm run lint` (ESLint), `npm run compile` (type-check), `npm test` (node:test unit + activation tests), `npm run test:integration` (real VS Code via `@vscode/test-electron`), `npm run package`
+- GitHub Actions CI workflow
+
+### Changed
+- Pure logic moved to `lib/helpers.js`; unused legacy quota panel/tooltip code removed
+
+---
+
+## [4.3.0] - 2026-01-25
+
+### Changed
+- **Opt-in proxy**: the proxy integration is disabled on first install; the extension only checks/starts the proxy after it is enabled from the model switcher
+- Removed hardcoded user paths from the PM2 fallback; updated the extension description
+
+---
+
+## [4.2.4] - 2026-01-03
+
+### Changed
+- Proxy toggle item in the model switcher simplified (no description text)
+- Signed-in account is refreshed every 60 seconds (was 15 minutes) and whenever the window gains focus
+
+---
+
+## [4.2.3] - 2026-01-03
+
+### Changed
+- Version bump for Open VSX (no code changes)
+
+---
+
 ## [4.2.2] - 2026-01-03
 
 ### Fixed
@@ -54,6 +102,16 @@ All notable changes to the VS Code extension will be documented in this file.
 ### Fixed
 - **Model Ping-Pong**: Fixed issue where multiple windows would conflict over model selection
 - **Proxy Entry Point**: Extension now starts `index.js` instead of `server.js`
+
+---
+
+## [4.0.0] - 2026-01-02
+
+### Added
+- **Per-Window Model Selection**: each window maintains its own model independently; the choice persists per workspace
+
+### Fixed
+- Model "ping-pong" when multiple windows were open
 
 ---
 
