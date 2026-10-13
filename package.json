@@ -6,7 +6,7 @@
     "publisher": "ai-dev-2024",
     "repository": {
         "type": "git",
-        "url": "https://github.com/ai-dev-2024/Antigravity-Claude-Code-Proxy"
+        "url": "https://github.com/muhib-karim/Claude-Proxy-Extension"
     },
     "icon": "icon.png",
     "license": "MIT",
@@ -28,6 +28,11 @@
         "onStartupFinished"
     ],
     "main": "./extension.js",
+    "scripts": {
+        "lint": "eslint .",
+        "test": "node --test test/*.test.js",
+        "check": "npm run lint && npm test"
+    },
     "contributes": {
         "commands": [
             {
@@ -43,5 +48,14 @@
                 "title": "Antigravity: Show Quota Info"
             }
         ]
+    },
+    "homepage": "https://open-vsx.org/extension/ai-dev-2024/claude-proxy-status",
+    "bugs": {
+        "url": "https://github.com/muhib-karim/Claude-Proxy-Extension/issues"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.5",
+        "eslint": "^9.39.5",
+        "globals": "^17.13.0"
     }
 }

@@ -4,6 +4,26 @@ All notable changes to the VS Code extension will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Per-window session id**: The proxy session id is now stored in `workspaceState`. Before this it was in `globalState`, so every window sent the same id to `/session-model`.
+- **Quota bar crash**: Quota bars now clamp out-of-range percentages. Before this, `String.repeat` could throw a `RangeError`.
+- **Account list**: Accounts with no email no longer crash the popup, and reset times are no longer shown next to a missing (`—`) percentage.
+- **Timers**: The 60 s account poll timer is now cleared on deactivate.
+- **Packaging**: Stale unpacked VSIX folders (`extracted-3.3.0`, `extracted-3.4.0`) were removed from the repository and are no longer bundled. The VSIX now contains only runtime files.
+
+### Changed
+- Pure logic (quota aggregation, formatting, `wmic`/`netstat` parsing) moved to `lib/quota.js`.
+- The activation log line reports the real version from `package.json`.
+- `publish.ps1` packages with a PNG banner (vsce rejects SVG images) and publishes that exact VSIX.
+- `repository` now points to github.com/muhib-karim/Claude-Proxy-Extension.
+
+### Added
+- Unit tests and an activation smoke test (`npm test`), ESLint (`npm run lint`), and GitHub Actions CI.
+
+---
+
 ## [4.2.2] - 2026-01-03
 
 ### Fixed

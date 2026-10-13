@@ -1,6 +1,12 @@
 .vscode/**
 .vscode-test/**
+.github/**
 node_modules/**
+test/**
+docs/**
 *.log
 .gitignore
 .env
+eslint.config.js
+publish.ps1
+screenshot-*.png
