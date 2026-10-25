@@ -5,7 +5,7 @@
 <p align="center"><b>Per-window model switching and live quota monitoring for a local Claude / Gemini proxy, right in the VS Code status bar.</b></p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="Top language" src="https://img.shields.io/github/languages/top/muhib-karim/Claude-Proxy-Extension">
   <a href="https://github.com/muhib-karim/Claude-Proxy-Extension/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/muhib-karim/Claude-Proxy-Extension/actions/workflows/ci.yml/badge.svg"></a>
 </p>
@@ -129,4 +129,5 @@ icon.png, screenshot*.png
 
 ## License
 
-[MIT](LICENSE)
+MIT License. Copyright 2026 Muhib Karim. See [LICENSE](LICENSE).
+
