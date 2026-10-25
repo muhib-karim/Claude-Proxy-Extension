@@ -127,6 +127,10 @@ icon.png, screenshot*.png
 - The PM2 fallback in the offline model switcher assumes a specific proxy checkout path under the home directory.
 - The tests don't drive a real VS Code instance (no `@vscode/test-electron` run). UI behaviour beyond activation is not covered by automated tests.
 
+## Contributing
+
+Issues and pull requests are welcome. Before opening a pull request, run `npm test` and `npm run lint`. Please keep each pull request focused and say how you tested it.
+
 ## License
 
 [MIT](LICENSE)
