@@ -6,6 +6,17 @@ const path = require('path');
 const os = require('os');
 const { exec } = require('child_process');
 const crypto = require('crypto');
+const {
+    MODELS,
+    processQuotaData,
+    sortAccountsByClaudeQuota,
+    shortEmail,
+    createSmallQuotaBar,
+    formatResetTime,
+    getDisplayName,
+    parseWmicOutput,
+    parseNetstatPorts
+} = require('./lib/quota');
 
 // ==================== STATE ====================
 let quotaStatusBarItem = null;        // Shows quota summary on hover
@@ -14,10 +25,10 @@ let currentModel = 'unknown';
 let isProxyOnline = false;
 let isProxyEnabled = false;           // Toggle to enable/disable proxy (default OFF to avoid conflicts with Antigravity Manager Tool)
 let pollInterval = null;
+let accountPollInterval = null;
 let settingsWatcher = null;           // File watcher for Claude Code settings
 let proxyQuotaData = null;            // Quota data from proxy /account-limits
 let currentIDEAccount = null;         // Antigravity signed-in account
-let lastTooltipData = null;           // Cache to prevent tooltip flickering
 
 // Per-window model persistence
 let extensionContext = null;          // Store context for workspaceState access
@@ -30,21 +41,11 @@ const PROXY_POLL_INTERVAL_MS = 5000;
 const ACCOUNT_POLL_INTERVAL_MS = 60 * 1000;  // 60 seconds - refresh account frequently
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 
-// Available models for quick switching
-const MODELS = [
-    { label: '⚡ Flash', model: 'gemini-3-flash', description: 'Fast tasks' },
-    { label: '💎 Pro', model: 'gemini-3-pro-high', description: 'Complex coding' },
-    { label: '🎭 Opus', model: 'claude-opus-4-5-thinking', description: 'Deep reasoning' },
-    { label: '🎵 Sonnet', model: 'claude-sonnet-4-5-thinking', description: 'Balanced' },
-    { label: '🌐 Grok', model: 'pplx-grok', description: 'With web search' },
-    { label: '🔍 Perplexity', model: 'sonar', description: 'Search focused' },
-];
 
 // ==================== PROXY AUTO-START ====================
 
 // Ensure proxy is running - called on extension activation
 function ensureProxyRunning() {
-    const http = require('http');
 
     // Quick check if proxy is responding
     const req = http.request({
@@ -61,7 +62,6 @@ function ensureProxyRunning() {
     req.on('error', () => {
         // Proxy is not running, try to start it via PM2
         console.log('[Claude Proxy] Proxy offline, attempting PM2 restart...');
-        const { exec } = require('child_process');
         // Use pm2 restart (assumes proxy was previously registered with PM2)
         exec('pm2 restart antigravity-proxy', (error) => {
             if (error) {
@@ -81,7 +81,6 @@ function ensureProxyRunning() {
 
 // Direct PM2 start - called when user clicks Enable or to recover crashed proxy
 function startProxyViaPM2() {
-    const { exec } = require('child_process');
 
     console.log('[Claude Proxy] Starting proxy via PM2...');
     // Try restart first (works if process exists in PM2)
@@ -91,7 +90,6 @@ function startProxyViaPM2() {
             vscode.window.showWarningMessage('Proxy not found in PM2. Please run setup: scripts/setup/SETUP_STARTUP.bat');
         } else {
             console.log('[Claude Proxy] Proxy restarted via PM2');
-            console.log('[Claude Proxy] Proxy restarted via PM2');
         }
     });
 }
@@ -99,7 +97,8 @@ function startProxyViaPM2() {
 // ==================== ACTIVATION ====================
 
 function activate(context) {
-    console.log('[Claude Proxy] Extension v4.2.2 activated');
+    const version = context.extension && context.extension.packageJSON ? context.extension.packageJSON.version : '';
+    console.log(`[Claude Proxy] Extension v${version} activated`);
 
     // Store context for workspaceState access in other functions
     extensionContext = context;
@@ -116,11 +115,11 @@ function activate(context) {
         ensureProxyRunning();
     }
 
-    // Generate or retrieve unique window ID
-    windowId = context.globalState.get('antigravity.windowId');
+    // Generate or retrieve unique window ID (workspaceState, so each workspace gets its own proxy session)
+    windowId = context.workspaceState.get('antigravity.windowId');
     if (!windowId) {
         windowId = crypto.randomUUID();
-        context.globalState.update('antigravity.windowId', windowId);
+        context.workspaceState.update('antigravity.windowId', windowId);
         console.log(`[Claude Proxy] Generated new window ID: ${windowId.slice(0, 8)}...`);
     }
 
@@ -205,7 +204,6 @@ function activate(context) {
                     }
 
                     // Start the proxy via PM2 for model selection
-                    const { exec } = require('child_process');
                     exec('pm2 restart antigravity-proxy || pm2 start "' + path.join(os.homedir(), 'Desktop/Projects/Antigravity-Claude-Code-Proxy/Antigravity-Claude-Code-Proxy/src/index.js') + '" --name antigravity-proxy', (error) => {
                         if (error) {
                             vscode.window.showErrorMessage('Failed to start proxy. Run: pm2 restart antigravity-proxy');
@@ -264,7 +262,7 @@ function activate(context) {
     );
 
     // Periodic account refresh
-    setInterval(() => {
+    accountPollInterval = setInterval(() => {
         fetchIDEAccount();
     }, ACCOUNT_POLL_INTERVAL_MS);
 
@@ -295,6 +293,7 @@ function activate(context) {
     context.subscriptions.push({
         dispose: () => {
             if (pollInterval) clearInterval(pollInterval);
+            if (accountPollInterval) clearInterval(accountPollInterval);
             if (settingsWatcher) settingsWatcher.close();
         }
     });
@@ -322,7 +321,7 @@ function updateQuotaStatusBar() {
 
     // Show account name if available
     if (currentIDEAccount) {
-        const shortEmail = currentIDEAccount.email.split('@')[0];
+        const shortEmail = shortEmail(currentIDEAccount.email);
         quotaStatusBarItem.text = `$(account) ${shortEmail}`;
     } else {
         quotaStatusBarItem.text = '$(account)';
@@ -369,52 +368,21 @@ async function showQuotaQuickPick() {
                 kind: vscode.QuickPickItemKind.Separator
             });
 
-            // Pre-calculate Claude quota for each account for sorting
-            const accountsWithQuota = proxyQuotaData.accounts.map(acc => {
-                let claudePct = null, geminiPct = null;
-                let claudeReset = null, geminiReset = null;
-
-                if (acc.limits) {
-                    for (const [modelId, info] of Object.entries(acc.limits)) {
-                        if (modelId.includes('claude')) {
-                            if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                                const pct = Math.round(info.remainingFraction * 100);
-                                if (claudePct === null || pct < claudePct) claudePct = pct;
-                            }
-                            if (info.resetTime) claudeReset = info.resetTime;
-                        } else if (modelId.includes('gemini')) {
-                            if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                                const pct = Math.round(info.remainingFraction * 100);
-                                if (geminiPct === null || pct < geminiPct) geminiPct = pct;
-                            }
-                            if (info.resetTime) geminiReset = info.resetTime;
-                        }
-                    }
-                }
-
-                return { acc, claudePct, geminiPct, claudeReset, geminiReset };
-            });
-
-            // Sort by Claude quota descending (accounts with Claude available at top)
-            accountsWithQuota.sort((a, b) => {
-                const aPct = a.claudePct !== null ? a.claudePct : -1;
-                const bPct = b.claudePct !== null ? b.claudePct : -1;
-                return bPct - aPct;  // Descending
-            });
+            const accountsWithQuota = sortAccountsByClaudeQuota(proxyQuotaData.accounts);
 
             for (const { acc, claudePct, geminiPct, claudeReset, geminiReset } of accountsWithQuota) {
-                const shortEmail = acc.email.split('@')[0];
+                const name = shortEmail(acc.email);
 
                 const claudeStr = claudePct !== null ? `${createSmallQuotaBar(claudePct)} ${claudePct}%` : '—';
                 const geminiStr = geminiPct !== null ? `${createSmallQuotaBar(geminiPct)} ${geminiPct}%` : '—';
 
                 let detail = `🟠 Claude: ${claudeStr}`;
-                if (claudeReset && claudePct < 100) detail += ` (resets ${formatResetTime(new Date(claudeReset))})`;
+                if (claudeReset && claudePct !== null && claudePct < 100) detail += ` (resets ${formatResetTime(new Date(claudeReset))})`;
                 detail += `  •  💎 Gemini: ${geminiStr}`;
-                if (geminiReset && geminiPct < 100) detail += ` (resets ${formatResetTime(new Date(geminiReset))})`;
+                if (geminiReset && geminiPct !== null && geminiPct < 100) detail += ` (resets ${formatResetTime(new Date(geminiReset))})`;
 
                 items.push({
-                    label: `👤 ${shortEmail}`,
+                    label: `👤 ${name}`,
                     detail: detail
                 });
             }
@@ -495,36 +463,7 @@ function detectAntigravityProcess() {
         exec('wmic process where "Name like \'%language_server%\'" get ProcessId,CommandLine /format:list',
             { timeout: 5000, maxBuffer: 10 * 1024 * 1024 },
             (error, stdout) => {
-                if (error || !stdout || stdout.trim() === '') {
-                    resolve(null);
-                    return;
-                }
-
-                // Parse WMIC output
-                const entries = stdout.split(/\r?\n\r?\n/).filter(block => block.trim());
-                for (const entry of entries) {
-                    const lines = entry.split(/\r?\n/).filter(l => l.trim());
-                    let commandLine = '';
-                    let pid = 0;
-
-                    for (const line of lines) {
-                        if (line.startsWith('CommandLine=')) {
-                            commandLine = line.substring('CommandLine='.length);
-                        } else if (line.startsWith('ProcessId=')) {
-                            pid = parseInt(line.substring('ProcessId='.length), 10);
-                        }
-                    }
-
-                    if (!commandLine || !pid) continue;
-
-                    // Extract CSRF token
-                    const csrfMatch = commandLine.match(/--csrf_token[=\s]+([^\s"]+)/i);
-                    if (csrfMatch && csrfMatch[1]) {
-                        resolve({ pid, csrfToken: csrfMatch[1], commandLine });
-                        return;
-                    }
-                }
-                resolve(null);
+                resolve(error ? null : parseWmicOutput(stdout));
             }
         );
     });
@@ -536,20 +475,7 @@ function getProcessPorts(pid) {
         exec(`netstat -ano | findstr "${pid}" | findstr "LISTENING"`,
             { timeout: 5000 },
             (error, stdout) => {
-                if (error || !stdout) {
-                    resolve([]);
-                    return;
-                }
-
-                const ports = new Set();
-                const lines = stdout.split('\n');
-                for (const line of lines) {
-                    const match = line.match(/:(\d+)\s+[\d.:]+\s+LISTENING/);
-                    if (match && match[1]) {
-                        ports.add(parseInt(match[1], 10));
-                    }
-                }
-                resolve(Array.from(ports).sort((a, b) => a - b));
+                resolve(error ? [] : parseNetstatPorts(stdout));
             }
         );
     });
@@ -665,67 +591,10 @@ function fetchProxyQuotaData() {
     req.end();
 }
 
-// Process quota data - aggregate by model family
-function processQuotaData(json) {
-    if (!json || !json.accounts || json.accounts.length === 0) {
-        return { claudeQuota: null, geminiQuota: null, accounts: [], models: {} };
-    }
-
-    const accounts = json.accounts;
-    const modelQuotas = {}; // { modelId: [pct1, pct2, ...] }
-    const accountSummaries = [];
-
-    for (const acc of accounts) {
-        if (acc.status !== 'ok' || !acc.limits) continue;
-
-        for (const [modelId, info] of Object.entries(acc.limits)) {
-            if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                const pct = Math.round(info.remainingFraction * 100);
-                if (!modelQuotas[modelId]) modelQuotas[modelId] = [];
-                modelQuotas[modelId].push(pct);
-            }
-        }
-
-        accountSummaries.push({
-            email: acc.email,
-            limits: acc.limits
-        });
-    }
-
-    // Aggregate by family - use MINIMUM across accounts (conservative)
-    let claudeQuota = null;
-    let geminiQuota = null;
-    const claudeModels = [];
-    const geminiModels = [];
-
-    for (const [modelId, pcts] of Object.entries(modelQuotas)) {
-        const minPct = Math.min(...pcts);
-
-        if (modelId.includes('claude')) {
-            claudeModels.push({ id: modelId, quota: minPct });
-            if (claudeQuota === null || minPct < claudeQuota) {
-                claudeQuota = minPct;
-            }
-        } else if (modelId.includes('gemini')) {
-            geminiModels.push({ id: modelId, quota: minPct });
-            if (geminiQuota === null || minPct < geminiQuota) {
-                geminiQuota = minPct;
-            }
-        }
-    }
-
-    return {
-        claudeQuota: claudeQuota,
-        geminiQuota: geminiQuota,
-        claudeModels: claudeModels.sort((a, b) => a.id.localeCompare(b.id)),
-        geminiModels: geminiModels.sort((a, b) => a.id.localeCompare(b.id)),
-        accounts: accountSummaries,
-        totalAccounts: json.totalAccounts || accounts.length
-    };
-}
-
 // ==================== CLAUDE CODE SETTINGS WATCHER ====================
 
+// Currently unused (see activate); kept for re-enabling global settings sync
+// eslint-disable-next-line no-unused-vars
 function watchClaudeSettings() {
     try {
         if (!fs.existsSync(CLAUDE_SETTINGS_PATH)) {
@@ -871,276 +740,11 @@ function updateModelStatusBar() {
     }
 }
 
-function getDisplayName(model) {
-    if (!model) return '❓';
-    const m = model.toLowerCase();
-    if (m.includes('flash')) return '⚡ Flash';
-    if (m.includes('pro')) return '💎 Pro';
-    if (m.includes('opus')) return '🎭 Opus';
-    if (m.includes('sonnet')) return '🎵 Sonnet';
-    if (m.includes('haiku')) return '📝 Haiku';
-    if (m.includes('grok')) return '🌐 Grok';
-    if (m.includes('pplx') || m.includes('sonar')) return '🔍 Perplexity';
-    return model.length > 15 ? model.substring(0, 12) + '...' : model;
-}
-
-// ==================== QUOTA INFO PANEL (Click-to-show) ====================
-
-async function showQuotaInfoPanel() {
-    const items = [];
-
-    // Header: Signed-in account
-    if (currentIDEAccount) {
-        items.push({
-            label: '$(account) Antigravity Account',
-            description: currentIDEAccount.email,
-            kind: vscode.QuickPickItemKind.Separator
-        });
-    }
-
-    // Proxy status
-    if (!isProxyOnline) {
-        items.push({
-            label: '$(warning) Proxy Offline',
-            description: 'Start the proxy to see quota info'
-        });
-    } else if (!proxyQuotaData) {
-        items.push({
-            label: '$(sync~spin) Loading...',
-            description: 'Fetching quota data'
-        });
-    } else {
-        // Overall quota
-        if (proxyQuotaData.claudeQuota !== null) {
-            const bar = createSmallQuotaBar(proxyQuotaData.claudeQuota);
-            items.push({
-                label: `🟠 Claude: ${bar} ${proxyQuotaData.claudeQuota}%`,
-                description: 'Overall'
-            });
-        }
-        if (proxyQuotaData.geminiQuota !== null) {
-            const bar = createSmallQuotaBar(proxyQuotaData.geminiQuota);
-            items.push({
-                label: `💎 Gemini: ${bar} ${proxyQuotaData.geminiQuota}%`,
-                description: 'Overall'
-            });
-        }
-
-        // Per-account breakdown
-        if (proxyQuotaData.accounts && proxyQuotaData.accounts.length > 0) {
-            items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
-            items.push({
-                label: `$(server) ${proxyQuotaData.totalAccounts} Account(s)`,
-                kind: vscode.QuickPickItemKind.Separator
-            });
-
-            for (const acc of proxyQuotaData.accounts) {
-                const shortEmail = acc.email.split('@')[0];
-
-                if (acc.limits) {
-                    let claudePct = null, geminiPct = null;
-                    let claudeResetTime = null, geminiResetTime = null;
-
-                    for (const [modelId, info] of Object.entries(acc.limits)) {
-                        if (modelId.includes('claude')) {
-                            if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                                const pct = Math.round(info.remainingFraction * 100);
-                                if (claudePct === null || pct < claudePct) claudePct = pct;
-                            }
-                            if (info.resetTime) claudeResetTime = info.resetTime;
-                        } else if (modelId.includes('gemini')) {
-                            if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                                const pct = Math.round(info.remainingFraction * 100);
-                                if (geminiPct === null || pct < geminiPct) geminiPct = pct;
-                            }
-                            if (info.resetTime) geminiResetTime = info.resetTime;
-                        }
-                    }
-
-                    let claudeStr = '';
-                    if (claudePct !== null || claudeResetTime) {
-                        const pct = claudePct !== null ? claudePct : 0;
-                        const bar = createSmallQuotaBar(pct);
-                        let resetStr = '';
-                        if (claudeResetTime && pct < 100) {
-                            resetStr = ` (resets ${formatResetTime(new Date(claudeResetTime))})`;
-                        }
-                        claudeStr = `🟠 ${bar} ${pct}%${resetStr}`;
-                    }
-
-                    let geminiStr = '';
-                    if (geminiPct !== null || geminiResetTime) {
-                        const pct = geminiPct !== null ? geminiPct : 0;
-                        const bar = createSmallQuotaBar(pct);
-                        let resetStr = '';
-                        if (geminiResetTime && pct < 100) {
-                            resetStr = ` (resets ${formatResetTime(new Date(geminiResetTime))})`;
-                        }
-                        geminiStr = `💎 ${bar} ${pct}%${resetStr}`;
-                    }
-
-                    items.push({
-                        label: `$(person) ${shortEmail}`,
-                        description: [claudeStr, geminiStr].filter(s => s).join('  ')
-                    });
-                }
-            }
-        }
-    }
-
-    // Footer: Open Dashboard
-    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
-    items.push({
-        label: '$(link-external) Open Dashboard',
-        description: 'View full details in browser',
-        action: 'dashboard'
-    });
-
-    const selected = await vscode.window.showQuickPick(items, {
-        title: '📊 Antigravity Quota Info',
-        placeHolder: 'Account and quota information'
-    });
-
-    if (selected && selected.action === 'dashboard') {
-        vscode.env.openExternal(vscode.Uri.parse('http://localhost:8080/dashboard#overview'));
-    }
-}
-
-// ==================== TOOLTIPS ====================
-
-function createQuotaTooltip() {
-    const md = new vscode.MarkdownString();
-    md.isTrusted = true;
-    md.supportThemeIcons = true;
-
-    // Header with signed-in account
-    if (currentIDEAccount) {
-        md.appendMarkdown(`### $(account) Antigravity Account\n\n`);
-        md.appendMarkdown(`**${currentIDEAccount.email}**\n\n`);
-    } else {
-        md.appendMarkdown(`### $(graph) Model Quotas\n\n`);
-    }
-
-    if (!proxyQuotaData) {
-        md.appendMarkdown(`$(warning) *Loading...*\n\n`);
-        md.appendMarkdown(`[$(link-external) Open Dashboard](command:antigravity.openDashboard)`);
-        return md;
-    }
-
-    // Overall Claude + Gemini summary
-    if (proxyQuotaData.claudeQuota !== null || proxyQuotaData.geminiQuota !== null) {
-        md.appendMarkdown(`**Overall:**\n`);
-        if (proxyQuotaData.claudeQuota !== null) {
-            const bar = createSmallQuotaBar(proxyQuotaData.claudeQuota);
-            md.appendMarkdown(`- 🟠 Claude: ${bar} ${proxyQuotaData.claudeQuota}%\n`);
-        }
-        if (proxyQuotaData.geminiQuota !== null) {
-            const bar = createSmallQuotaBar(proxyQuotaData.geminiQuota);
-            md.appendMarkdown(`- 💎 Gemini: ${bar} ${proxyQuotaData.geminiQuota}%\n`);
-        }
-        md.appendMarkdown(`\n`);
-    }
-
-    // Per-account breakdown with Claude/Gemini quotas and reset times
-    if (proxyQuotaData.accounts && proxyQuotaData.accounts.length > 0) {
-        md.appendMarkdown(`---\n\n`);
-        md.appendMarkdown(`### $(server) ${proxyQuotaData.totalAccounts} Account(s)\n\n`);
-
-        for (const acc of proxyQuotaData.accounts) {
-            const shortEmail = acc.email.split('@')[0];
-            md.appendMarkdown(`**${shortEmail}**\n`);
-
-            if (acc.limits) {
-                // Get Claude quota and reset time
-                let claudePct = null;
-                let geminiPct = null;
-                let claudeResetTime = null;
-                let geminiResetTime = null;
-
-                for (const [modelId, info] of Object.entries(acc.limits)) {
-                    if (modelId.includes('claude')) {
-                        if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                            const pct = Math.round(info.remainingFraction * 100);
-                            if (claudePct === null || pct < claudePct) claudePct = pct;
-                        }
-                        if (info.resetTime) claudeResetTime = info.resetTime;
-                    } else if (modelId.includes('gemini')) {
-                        if (info.remainingFraction !== undefined && info.remainingFraction !== null) {
-                            const pct = Math.round(info.remainingFraction * 100);
-                            if (geminiPct === null || pct < geminiPct) geminiPct = pct;
-                        }
-                        if (info.resetTime) geminiResetTime = info.resetTime;
-                    }
-                }
-
-                // Show Claude with reset time (even if 0% or if we only have reset time)
-                if (claudePct !== null || claudeResetTime) {
-                    const pct = claudePct !== null ? claudePct : 0;
-                    let resetStr = '';
-                    if (claudeResetTime && pct < 100) {
-                        resetStr = ` *(resets ${formatResetTime(new Date(claudeResetTime))})*`;
-                    }
-                    md.appendMarkdown(`  - 🟠 Claude: ${createSmallQuotaBar(pct)} ${pct}%${resetStr}\n`);
-                }
-
-                // Show Gemini with reset time (even if 0% or if we only have reset time)
-                if (geminiPct !== null || geminiResetTime) {
-                    const pct = geminiPct !== null ? geminiPct : 0;
-                    let resetStr = '';
-                    if (geminiResetTime && pct < 100) {
-                        resetStr = ` *(resets ${formatResetTime(new Date(geminiResetTime))})*`;
-                    }
-                    md.appendMarkdown(`  - 💎 Gemini: ${createSmallQuotaBar(pct)} ${pct}%${resetStr}\n`);
-                }
-            }
-            md.appendMarkdown(`\n`);
-        }
-    }
-
-    if (proxyQuotaData.claudeQuota === null && proxyQuotaData.geminiQuota === null) {
-        md.appendMarkdown(`$(info) *No quota data available*\n\n`);
-    }
-
-    // Footer
-    md.appendMarkdown(`---\n\n`);
-    md.appendMarkdown(`[$(link-external) Open Dashboard](command:antigravity.openDashboard)`);
-
-    return md;
-}
-
-function createSmallQuotaBar(percent) {
-    const filled = Math.round(percent / 10);
-    const empty = 10 - filled;
-    // Use same-size block characters: ▰ for filled, ▱ for empty
-    const filledChar = '▰';
-    const emptyChar = '▱';
-    return filledChar.repeat(filled) + emptyChar.repeat(empty);
-}
-
-function formatResetTime(resetDate) {
-    const now = new Date();
-    const diff = resetDate.getTime() - now.getTime();
-
-    if (diff <= 0) {
-        return 'soon';
-    }
-
-    const hours = Math.floor(diff / (1000 * 60 * 60));
-    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-    if (hours > 0) {
-        return `in ${hours}h ${minutes}m`;
-    } else if (minutes > 0) {
-        return `in ${minutes}m`;
-    } else {
-        return 'soon';
-    }
-}
-
 // ==================== DEACTIVATION ====================
 
 function deactivate() {
     if (pollInterval) clearInterval(pollInterval);
+    if (accountPollInterval) clearInterval(accountPollInterval);
     console.log('[Claude Proxy] Extension deactivated');
 }
 

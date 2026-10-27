@@ -17,11 +17,26 @@ if (-not $token) {
 }
 
 # Package
+# vsce rejects SVG images in README.md, so package with the PNG render of the banner
 Write-Host "Packaging Extension..."
-npx -y @vscode/vsce package --allow-missing-repository
+$version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+$vsix = "claude-proxy-status-$version.vsix"
+$readmePath = Join-Path $PWD 'README.md'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$readme = [System.IO.File]::ReadAllText($readmePath, $utf8)
+try {
+    [System.IO.File]::WriteAllText($readmePath, $readme.Replace('docs/banner.svg', 'docs/banner.png'), $utf8)
+    npx -y @vscode/vsce package --out $vsix
+} finally {
+    [System.IO.File]::WriteAllText($readmePath, $readme, $utf8)
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Packaging failed."
+    exit 1
+}
 
 # Publish
 Write-Host "Publishing to Open VSX..."
-npx -y ovsx publish -p $token
+npx -y ovsx publish $vsix -p $token
 
 Write-Host "Done!"
