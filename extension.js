@@ -36,6 +36,8 @@ let healthCheckInFlight = false;      // One /active-model poll at a time
 let quotaFetchInFlight = false;       // One /account-limits poll at a time
 let ideAccountFetchInFlight = false;  // One account lookup (wmic + netstat + GetUserStatus) at a time
 let ideAccountFetchQueued = false;    // A trigger arrived mid-lookup: run once more when it finishes
+let sessionModelSynced = false;       // The proxy has this window's model for the current online period
+let sessionResendInFlight = false;    // A silent re-send of the saved model is running
 let modelStartGeneration = 0;         // Bumped by every "start the proxy, then set the model" request
 
 // Per-window model persistence
@@ -251,6 +253,7 @@ function setProxyEnabled(enabled) {
         // Nothing is polled while disabled, so what we knew about the proxy is stale from here on
         isProxyOnline = false;
         proxyQuotaData = null;
+        sessionModelSynced = false;
     }
     updateModelStatusBar();
     updateQuotaStatusBar();
@@ -269,6 +272,8 @@ function activate(context) {
     quotaFetchInFlight = false;
     ideAccountFetchInFlight = false;
     ideAccountFetchQueued = false;
+    sessionModelSynced = false;
+    sessionResendInFlight = false;
 
     // Load saved proxy enabled state
     const savedProxyEnabled = context.globalState.get('antigravity.proxyEnabled');
@@ -825,9 +830,12 @@ function checkProxyHealth() {
     healthCheckInFlight = true;
     const done = () => { healthCheckInFlight = false; };
     const setOnline = (online) => {
+        const cameOnline = online && !isProxyOnline;
         isProxyOnline = online;
+        if (!online) sessionModelSynced = false;    // a proxy that went away may come back without our model
         updateModelStatusBar();
         updateQuotaStatusBar();
+        if (cameOnline) resendWindowModel();
     };
 
     const req = http.request({
@@ -887,7 +895,8 @@ function checkProxyHealth() {
 }
 
 
-function setModelOnProxy(model) {
+// POST this window's model to the proxy's per-session endpoint. Resolves on HTTP 200.
+function postSessionModel(model) {
     return new Promise((resolve, reject) => {
         // Use session-model endpoint for per-window model isolation
         const postData = JSON.stringify({
@@ -908,17 +917,6 @@ function setModelOnProxy(model) {
         }, (res) => {
             readBody(res).then((data) => {
                 if (res.statusCode === 200) {
-                    currentModel = model;
-                    // Save to workspaceState for per-window persistence (also when the window is
-                    // closing: the proxy has accepted the model, so the saved state must match)
-                    if (extensionContext) {
-                        extensionContext.workspaceState.update(WINDOW_MODEL_KEY, model);
-                        console.log(`[Claude Proxy] Saved session model: ${windowId.slice(0, 8)} -> ${model}`);
-                    }
-                    if (!isDisposed) {
-                        updateModelStatusBar();
-                        vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
-                    }
                     resolve();
                 } else {
                     console.log(`[Claude Proxy] /session-model answered HTTP ${res.statusCode}: ${String(data).slice(0, 200)}`);
@@ -931,6 +929,41 @@ function setModelOnProxy(model) {
         req.on('timeout', () => req.destroy(timeoutError()));
         req.write(postData);
         req.end();
+    });
+}
+
+// The user picked a model: send it to the proxy, remember it for this window and show it
+async function setModelOnProxy(model) {
+    await postSessionModel(model);
+    currentModel = model;
+    sessionModelSynced = true;
+    // Save to workspaceState for per-window persistence (also when the window is closing: the
+    // proxy has accepted the model, so the saved state must match)
+    if (extensionContext) {
+        extensionContext.workspaceState.update(WINDOW_MODEL_KEY, model);
+        console.log(`[Claude Proxy] Saved session model: ${windowId.slice(0, 8)} -> ${model}`);
+    }
+    if (!isDisposed) {
+        updateModelStatusBar();
+        vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
+    }
+}
+
+// The proxy keeps per-window (session) models in memory only. After it restarts it no longer knows
+// this window's model, while the status bar still shows the saved one. Called when the proxy goes
+// from offline to online: quietly send the saved model again. One attempt per reconnect, and a
+// failure is only logged, because the user did not ask for anything.
+function resendWindowModel() {
+    const savedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
+    if (!savedModel || sessionModelSynced || sessionResendInFlight) return;
+    sessionResendInFlight = true;
+    postSessionModel(savedModel).then(() => {
+        sessionModelSynced = true;
+        console.log(`[Claude Proxy] Re-sent session model after reconnect: ${windowId.slice(0, 8)} -> ${savedModel}`);
+    }, (e) => {
+        console.log('[Claude Proxy] Could not re-send session model after reconnect:', e && e.message);
+    }).finally(() => {
+        sessionResendInFlight = false;
     });
 }
 

@@ -677,3 +677,137 @@ test('the signed-in e-mail address is not written to the log', async () => {
         assert.deepEqual(h.state.logs.filter((l) => l.includes('alice@example.com')), []);
     });
 });
+
+// ---------- Reconnect: the proxy forgets session models when it restarts ----------
+
+const WINDOW_ID = '11111111-2222-4333-8444-555555555555';
+const savedWindow = (model = OPUS) => ({ 'antigravity.windowModel': model, 'antigravity.windowId': WINDOW_ID });
+const sessionPosts = (h) => h.requests('http', '/session-model');
+
+test('the saved window model is re-sent silently whenever the proxy comes back online', async () => {
+    let online = true;
+    const routes = proxyUp();
+    await withHarness({
+        globalState: ENABLED, workspaceState: savedWindow(),
+        http: (record) => (online ? routes[record.path] : 'refuse')
+    }, async (h) => {
+        h.activate();
+        // First connect after activation: the proxy may have restarted since the model was chosen
+        await h.waitFor(() => sessionPosts(h).length === 1, 'model re-sent on first connect');
+        assert.equal(sessionPosts(h)[0].method, 'POST');
+        assert.deepEqual(JSON.parse(sessionPosts(h)[0].body), { model: OPUS, sessionId: WINDOW_ID, name: 'test-workspace' });
+        await h.settle();
+        assert.equal(h.modelItem.text, '🎭 Opus');
+
+        // While the proxy stays online nothing is re-sent
+        h.tickIntervals(5000);
+        await h.settle();
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(sessionPosts(h).length, 1);
+
+        // The proxy restarts: offline, then online again
+        online = false;
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+        online = true;
+        h.tickIntervals(5000);
+        await h.waitFor(() => sessionPosts(h).length === 2, 'model re-sent after the proxy came back');
+        await h.settle();
+        assert.deepEqual(JSON.parse(sessionPosts(h)[1].body), { model: OPUS, sessionId: WINDOW_ID, name: 'test-workspace' });
+
+        assert.deepEqual(h.messages(), [], 'the re-send is silent');
+        assert.equal(h.modelItem.text, '🎭 Opus');
+        assert.equal(h.context.workspaceState.get('antigravity.windowModel'), OPUS);
+    });
+});
+
+test('a window that never chose a model sends nothing on reconnect', async () => {
+    let online = true;
+    const routes = proxyUp();
+    await withHarness({
+        globalState: ENABLED, http: (record) => (online ? routes[record.path] : 'refuse')
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+        online = false;
+        h.tickIntervals(5000);
+        await h.settle();
+        online = true;
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.modelItem.text, '⚡ Flash');
+        assert.equal(sessionPosts(h).length, 0);
+    });
+});
+
+test('a failed silent re-send shows nothing, keeps the model and is retried on the next reconnect', async () => {
+    let online = true;
+    let sessionStatus = 500;
+    const routes = proxyUp();
+    await withHarness({
+        globalState: ENABLED, workspaceState: savedWindow(),
+        http: (record) => {
+            if (!online) return 'refuse';
+            if (record.path === '/session-model') return { status: sessionStatus, body: '{}' };
+            return routes[record.path];
+        }
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => sessionPosts(h).length === 1, 'first re-send');
+        await h.settle();
+        assert.deepEqual(h.messages(), []);
+        assert.equal(h.modelItem.text, '🎭 Opus');
+        assert.deepEqual(h.state.unhandledRejections, []);
+
+        h.tickIntervals(5000);      // still online: not retried on every poll
+        await h.settle();
+        assert.equal(sessionPosts(h).length, 1);
+
+        online = false;
+        h.tickIntervals(5000);
+        await h.settle();
+        online = true;
+        sessionStatus = 200;
+        h.tickIntervals(5000);
+        await h.waitFor(() => sessionPosts(h).length === 2, 're-send on the next reconnect');
+        await h.settle();
+        assert.deepEqual(h.messages(), []);
+    });
+});
+
+test('choosing a model is not followed by a redundant re-send of the same model', async () => {
+    // Online switch
+    await withHarness({ globalState: ENABLED, pick: pickModel(OPUS), http: proxyUp() }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+        await h.command('antigravity.switchModel');
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(sessionPosts(h).length, 1);
+    });
+
+    // Offline pick: the model is set right after the proxy starts, then the health check sees it online
+    const routes = proxyUp();
+    let phase = 'down';             // 'down' -> 'armed' (the next pm2 call starts the proxy) -> 'up'
+    await withHarness({
+        globalState: ENABLED, fastTimers: true, pick: pickModel(OPUS),
+        exec: (command) => {
+            if (!command.startsWith('pm2')) return null;
+            if (phase === 'armed') phase = 'up';
+            return 'ok';
+        },
+        http: (record) => (phase === 'up' ? routes[record.path] : 'refuse')
+    }, async (h) => {
+        h.activate();               // activation's own auto-start does not bring the proxy up
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+        phase = 'armed';
+        await h.command('antigravity.switchModel');
+        await h.waitFor(() => h.modelItem.text === '🎭 Opus', 'model shown');
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(sessionPosts(h).length, 1);
+    });
+});
