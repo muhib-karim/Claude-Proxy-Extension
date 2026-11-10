@@ -199,6 +199,7 @@ function describeRequestError(error) {
     if (!error) return 'unknown error';
     if (error.code === 'ECONNREFUSED') return 'the proxy is not reachable';
     if (error.code === 'ETIMEDOUT') return 'the proxy did not answer in time';
+    if (error.code === 'ECONNRESET') return 'the proxy closed the connection';
     return error.message || String(error);
 }
 

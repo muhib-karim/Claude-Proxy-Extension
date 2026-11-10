@@ -183,7 +183,7 @@ test('a model switch settles when the proxy drops the connection mid-response', 
         ]);
         assert.equal(outcome, 'settled', 'the command must not stay pending forever');
         assert.equal(h.modelItem.text, '⚡ Flash', 'the model is unchanged');
-        assert.ok(h.messages('error').some((m) => m.startsWith('Failed to switch model')));
+        assert.deepEqual(h.messages('error'), ['Failed to switch model: the proxy closed the connection']);
     });
 });
 
