@@ -384,3 +384,33 @@ test('enabling the proxy starts it via PM2; a failure names the setting, not a W
         assert.doesNotMatch(warnings[0], /\.bat/);
     });
 });
+
+// ---------- B7: activation must not restart a proxy that is only slow ----------
+
+test('a slow /health answer at activation does not restart the proxy', async () => {
+    await withHarness({
+        globalState: ENABLED, http: proxyUp({ '/health': 'timeout' }), exec: () => 'ok'
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.requests('http', '/health').some((r) => r.destroyed), 'health check timed out');
+        await h.settle();
+        assert.deepEqual(pm2Commands(h), [], 'slow is not down: restarting would drop every window\'s requests');
+    });
+});
+
+test('a refused /health connection at activation restarts the proxy exactly once', async () => {
+    await withHarness({ globalState: ENABLED, http: {}, exec: () => 'ok' }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.deepEqual(pm2Commands(h), ['pm2 restart antigravity-proxy']);
+    });
+});
+
+test('the /health response at activation is drained so the socket is released', async () => {
+    await withHarness({ globalState: ENABLED, http: proxyUp() }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.requests('http', '/health')[0].resumed, true);
+        assert.deepEqual(pm2Commands(h), []);
+    });
+});

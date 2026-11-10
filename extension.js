@@ -83,6 +83,7 @@ function isInvalidScriptPath(error) {
 function ensureProxyRunning() {
 
     // Quick check if proxy is responding
+    let timedOut = false;
     const req = http.request({
         hostname: 'localhost',
         port: 8080,
@@ -91,10 +92,17 @@ function ensureProxyRunning() {
         timeout: 2000
     }, (res) => {
         // Proxy is running, nothing to do
+        res.resume();   // drain the response so the socket is released
         console.log('[Claude Proxy] Proxy already running');
     });
 
     req.on('error', () => {
+        if (timedOut) {
+            // Slow is not down. Restarting here would drop the in-flight requests of every
+            // window, once per window that is starting up; the regular poll will report the state.
+            console.log('[Claude Proxy] Proxy health check timed out; not restarting');
+            return;
+        }
         // Proxy is not running, try to start it via PM2
         console.log('[Claude Proxy] Proxy offline, attempting PM2 restart...');
         runPm2Start((error) => {
@@ -107,7 +115,8 @@ function ensureProxyRunning() {
     });
 
     req.on('timeout', () => {
-        req.destroy();
+        timedOut = true;
+        req.destroy();  // emits 'error' on the request
     });
 
     req.end();
