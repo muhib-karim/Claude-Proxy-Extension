@@ -472,10 +472,17 @@ function detectAntigravityProcess() {
 // Get listening ports for a process (Windows)
 function getProcessPorts(pid) {
     return new Promise((resolve) => {
+        // The pid is interpolated into a shell command, so only a plain positive integer is accepted
+        if (!Number.isInteger(pid) || pid <= 0) {
+            resolve([]);
+            return;
+        }
+        // findstr only narrows the output (it matches substrings); parseNetstatPorts keeps the
+        // rows whose PID column is exactly this pid
         exec(`netstat -ano | findstr "${pid}" | findstr "LISTENING"`,
             { timeout: 5000 },
             (error, stdout) => {
-                resolve(error ? [] : parseNetstatPorts(stdout));
+                resolve(error ? [] : parseNetstatPorts(stdout, pid));
             }
         );
     });

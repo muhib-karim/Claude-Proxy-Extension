@@ -86,3 +86,25 @@ test('a known account never makes a healthy proxy look offline', async () => {
         assert.equal(h.quotaItem.text, '$(account) alice');
     });
 });
+
+// ---------- B2: CSRF token must only go to the language server's own ports ----------
+
+test('the CSRF token is only sent to ports owned by the language server PID', async () => {
+    // What `netstat -ano | findstr "4242"` really returns: findstr matches substrings
+    const netstat = [
+        '  TCP    127.0.0.1:53000        0.0.0.0:0              LISTENING       4242',
+        '  TCP    127.0.0.1:4242         0.0.0.0:0              LISTENING       999',
+        '  TCP    127.0.0.1:61000        0.0.0.0:0              LISTENING       42421'
+    ].join('\r\n');
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, http: proxyUp(), https: {}, exec: windowsTools({ netstat })
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.requests('https', GET_USER_STATUS).length > 0, 'account lookup');
+        await h.settle();
+        const tokenPorts = [...new Set(
+            h.state.requests.filter((r) => r.headers['X-Codeium-Csrf-Token']).map((r) => r.port)
+        )].sort((a, b) => a - b);
+        assert.deepEqual(tokenPorts, [53000]);
+    });
+});

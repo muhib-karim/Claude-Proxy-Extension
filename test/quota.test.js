@@ -137,3 +137,21 @@ test('parseNetstatPorts returns sorted unique listening ports (IPv4 and IPv6)', 
     assert.deepEqual(q.parseNetstatPorts(out), [52999, 53021]);
     assert.deepEqual(q.parseNetstatPorts(''), []);
 });
+
+test('parseNetstatPorts keeps only rows owned by the exact PID', () => {
+    // `findstr "4242"` matches substrings, so its output also contains other processes' rows
+    const out = [
+        '  TCP    127.0.0.1:53000        0.0.0.0:0              LISTENING       4242',
+        '  TCP    127.0.0.1:42100        0.0.0.0:0              LISTENING       4242',
+        '  TCP    [::1]:42101            [::]:0                 LISTENING       4242',
+        '  TCP    127.0.0.1:42100        0.0.0.0:0              LISTENING       4242',
+        '  TCP    127.0.0.1:4242         0.0.0.0:0              LISTENING       999',     // port 4242, pid 999
+        '  TCP    127.0.0.1:61000        0.0.0.0:0              LISTENING       42421',   // pid 42421
+        '  TCP    127.0.0.1:50000        127.0.0.1:4242         ESTABLISHED     4242'
+    ].join('\r\n');
+    assert.deepEqual(q.parseNetstatPorts(out, 4242), [42100, 42101, 53000]);
+    assert.deepEqual(q.parseNetstatPorts(out, '4242'), [42100, 42101, 53000]);
+    assert.deepEqual(q.parseNetstatPorts(out, 7), []);
+    // Without a pid every listening port is returned
+    assert.deepEqual(q.parseNetstatPorts(out), [4242, 42100, 42101, 53000, 61000]);
+});
