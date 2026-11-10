@@ -2,7 +2,7 @@
     "name": "claude-proxy-status",
     "displayName": "Antigravity Proxy Status",
     "description": "Model switching with account & quota display - proxy auto-starts only when enabled",
-    "version": "4.3.0",
+    "version": "4.3.1",
     "publisher": "ai-dev-2024",
     "repository": {
         "type": "git",
