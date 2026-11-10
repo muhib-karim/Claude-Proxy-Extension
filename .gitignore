@@ -1,4 +1,11 @@
 node_modules
 .vscode-test
 *.vsix
+*.log
+
+# Local secrets and key material: never commit, never package (see .vscodeignore)
 .env
+.env.*
+.secrets
+*.pem
+*.key

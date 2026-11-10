@@ -8,18 +8,109 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: Lint and test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         node-version: [20, 22]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm run lint
       - run: npm test
+
+  # Builds the VSIX exactly as a release would and inspects what is inside it. Nothing is published.
+  package:
+    name: Package dry run and content check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      # Installs the dev dependencies on purpose: node_modules must not end up in the package either
+      - run: npm ci
+
+      # Published builds once shipped a local .secrets file. Recreate that situation with harmless
+      # decoys, so the checks below prove such files are kept out rather than just being absent.
+      - name: Plant decoy files that must never be packaged
+        run: |
+          printf 'OVSX_TOKEN=decoy-not-a-real-token\n' > .secrets
+          cp .secrets .env
+          cp .secrets .env.local
+          cp .secrets lib/.secrets
+          mkdir -p extracted-9.9.9/extension
+          touch server.pem private.key old-build.vsix extracted-9.9.9/extension/extension.js
+
+      - name: vsce ls must not list secret-like or unexpected files
+        run: npm run verify:package
+
+      - name: Package the VSIX (decoys still present)
+        run: npx --yes @vscode/vsce@4.1.0 package --out "$RUNNER_TEMP/claude-proxy-status.vsix"
+
+      - name: List the VSIX contents
+        run: unzip -Z1 "$RUNNER_TEMP/claude-proxy-status.vsix" | tee "$RUNNER_TEMP/vsix-files.txt"
+
+      - name: Fail if anything forbidden is inside the VSIX
+        run: |
+          node scripts/check-vsix-files.js < "$RUNNER_TEMP/vsix-files.txt"
+          # Second, independent check that does not rely on the script above
+          if grep -Ei '(^|/)\.secrets$|(^|/)\.env(\.|$)|\.(pem|key|vsix)$|(^|/)node_modules/|(^|/)test/|(^|/)extracted-' "$RUNNER_TEMP/vsix-files.txt"; then
+            echo "::error::A forbidden file is inside the VSIX (listed above)"
+            exit 1
+          fi
+
+      # The verified build, for publishing the exact file CI checked. A convenience only: the checks
+      # above are the gate, so a full account artifact quota must not turn the job red.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
+        with:
+          name: claude-proxy-status-vsix
+          path: ${{ runner.temp }}/claude-proxy-status.vsix
+          retention-days: 14
+          if-no-files-found: error
+
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Pinned: a .gitleaksignore fingerprint contains the rule id, which can change between
+      # gitleaks versions. Re-check the ignore file when bumping this.
+      GITLEAKS_VERSION: 8.21.2
+      GITLEAKS_SHA256: 5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history
+          persist-credentials: false
+      - name: Install gitleaks (pinned version, checksum verified)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan the git history
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --verbose .
+      - name: Scan the checked-out files
+        run: |
+          "$RUNNER_TEMP/gitleaks" dir --redact --no-banner --verbose .

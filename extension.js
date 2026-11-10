@@ -15,8 +15,10 @@ const {
     formatResetTime,
     getDisplayName,
     parseWmicOutput,
-    parseNetstatPorts
+    parseNetstatPorts,
+    parseUserStatusResponse
 } = require('./lib/quota');
+const { PM2_RESTART_COMMAND, PM2_STOP_COMMAND, buildPm2StartCommand } = require('./lib/pm2');
 
 // ==================== STATE ====================
 let quotaStatusBarItem = null;        // Shows quota summary on hover
@@ -29,6 +31,14 @@ let accountPollInterval = null;
 let settingsWatcher = null;           // File watcher for Claude Code settings
 let proxyQuotaData = null;            // Quota data from proxy /account-limits
 let currentIDEAccount = null;         // Antigravity signed-in account
+let isDisposed = false;               // Set on deactivate: late callbacks must not touch the UI
+let healthCheckInFlight = false;      // One /active-model poll at a time
+let quotaFetchInFlight = false;       // One /account-limits poll at a time
+let ideAccountFetchInFlight = false;  // One account lookup (wmic + netstat + GetUserStatus) at a time
+let ideAccountFetchQueued = false;    // A trigger arrived mid-lookup: run once more when it finishes
+let sessionModelSynced = false;       // The proxy has this window's model for the current online period
+let sessionResendInFlight = false;    // A silent re-send of the saved model is running
+let modelStartGeneration = 0;         // Bumped by every "start the proxy, then set the model" request
 
 // Per-window model persistence
 let extensionContext = null;          // Store context for workspaceState access
@@ -42,12 +52,44 @@ const ACCOUNT_POLL_INTERVAL_MS = 60 * 1000;  // 60 seconds - refresh account fre
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 
 
-// ==================== PROXY AUTO-START ====================
+// ==================== PROXY START / STOP (PM2) ====================
+
+// PM2 goes through a shell (pm2 is a .cmd shim on Windows). A hung pm2 must not block forever,
+// and no console window should flash on Windows.
+const PM2_EXEC_OPTIONS = { timeout: 20000, windowsHide: true };
+const PM2_START_HINT = 'Register the proxy once with "pm2 start <proxy-script> --name antigravity-proxy", or set "antigravity.proxyScriptPath".';
+
+// A freshly (re)started proxy gets this long to accept connections
+const PROXY_READY_ATTEMPTS = 20;
+const PROXY_READY_INTERVAL_MS = 500;
+
+function runPm2(command, callback) {
+    exec(command, PM2_EXEC_OPTIONS, (error) => callback(error || null));
+}
+
+// `pm2 restart antigravity-proxy`, falling back to `pm2 start <antigravity.proxyScriptPath>` when
+// that setting is configured (the proxy may not be registered with PM2 yet)
+function runPm2Start(callback) {
+    let command;
+    try {
+        const scriptPath = vscode.workspace.getConfiguration('antigravity').get('proxyScriptPath', '');
+        command = buildPm2StartCommand(scriptPath);
+    } catch (e) {
+        callback(e);    // invalid setting: nothing is executed
+        return;
+    }
+    runPm2(command, callback);
+}
+
+function isInvalidScriptPath(error) {
+    return !!error && /^Invalid antigravity\.proxyScriptPath/.test(error.message);
+}
 
 // Ensure proxy is running - called on extension activation
 function ensureProxyRunning() {
 
     // Quick check if proxy is responding
+    let timedOut = false;
     const req = http.request({
         hostname: 'localhost',
         port: 8080,
@@ -56,16 +98,22 @@ function ensureProxyRunning() {
         timeout: 2000
     }, (res) => {
         // Proxy is running, nothing to do
+        res.resume();   // drain the response so the socket is released
         console.log('[Claude Proxy] Proxy already running');
     });
 
     req.on('error', () => {
+        if (timedOut) {
+            // Slow is not down. Restarting here would drop the in-flight requests of every
+            // window, once per window that is starting up; the regular poll will report the state.
+            console.log('[Claude Proxy] Proxy health check timed out; not restarting');
+            return;
+        }
         // Proxy is not running, try to start it via PM2
         console.log('[Claude Proxy] Proxy offline, attempting PM2 restart...');
-        // Use pm2 restart (assumes proxy was previously registered with PM2)
-        exec('pm2 restart antigravity-proxy', (error) => {
+        runPm2Start((error) => {
             if (error) {
-                console.log('[Claude Proxy] PM2 restart failed. Please run: pm2 start <proxy-path> --name antigravity-proxy');
+                console.log(`[Claude Proxy] PM2 restart failed (${error.message}). ${PM2_START_HINT}`);
             } else {
                 console.log('[Claude Proxy] Proxy started successfully via PM2');
             }
@@ -73,25 +121,144 @@ function ensureProxyRunning() {
     });
 
     req.on('timeout', () => {
-        req.destroy();
+        timedOut = true;
+        req.destroy();  // emits 'error' on the request
     });
 
     req.end();
 }
 
-// Direct PM2 start - called when user clicks Enable or to recover crashed proxy
-function startProxyViaPM2() {
-
+// Start the proxy after the user enabled it, then show its state without waiting for the next poll
+async function startProxyViaPM2() {
     console.log('[Claude Proxy] Starting proxy via PM2...');
-    // Try restart first (works if process exists in PM2)
-    exec('pm2 restart antigravity-proxy', (restartErr) => {
-        if (restartErr) {
-            console.log('[Claude Proxy] PM2 restart failed. Proxy may not be registered.');
-            vscode.window.showWarningMessage('Proxy not found in PM2. Please run setup: scripts/setup/SETUP_STARTUP.bat');
+    const cancelled = () => isDisposed || !isProxyEnabled;
+    const error = await new Promise((resolve) => runPm2Start(resolve));
+    if (cancelled()) return;
+    if (error) {
+        console.log('[Claude Proxy] PM2 start failed:', error.message);
+        vscode.window.showWarningMessage(isInvalidScriptPath(error)
+            ? error.message
+            : `Could not start the proxy with PM2. ${PM2_START_HINT}`);
+    } else {
+        console.log('[Claude Proxy] Proxy restarted via PM2');
+        await waitForProxyReady(cancelled);     // refreshing before it listens would just paint "Offline"
+        if (cancelled()) return;
+    }
+    // Also after a PM2 failure: the proxy may be running without PM2
+    refreshProxyState();
+}
+
+// Stop the proxy after the user disabled it, and say what really happened
+function stopProxyViaPM2() {
+    runPm2(PM2_STOP_COMMAND, (error) => {
+        if (isDisposed) return;
+        if (error) {
+            console.log('[Claude Proxy] PM2 stop failed:', error.message);
+            vscode.window.showWarningMessage(`Proxy disabled, but PM2 could not stop it. Run: ${PM2_STOP_COMMAND}`);
         } else {
-            console.log('[Claude Proxy] Proxy restarted via PM2');
+            vscode.window.showInformationMessage('⏸️ Proxy stopped. Use Antigravity Manager instead.');
         }
     });
+}
+
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// One GET /health. Any HTTP answer means the proxy is listening.
+function probeProxyHealth() {
+    return new Promise((resolve) => {
+        const req = http.request({
+            hostname: 'localhost',
+            port: 8080,
+            path: '/health',
+            method: 'GET',
+            timeout: 1000
+        }, (res) => {
+            res.resume();
+            resolve(true);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => req.destroy());
+        req.end();
+    });
+}
+
+// Wait until a freshly (re)started proxy accepts connections. Bounded by attempt count, so it
+// always ends; `isCancelled` stops it early.
+async function waitForProxyReady(isCancelled) {
+    for (let attempt = 1; attempt <= PROXY_READY_ATTEMPTS; attempt++) {
+        if (isCancelled()) return false;
+        if (await probeProxyHealth()) return true;
+        if (attempt < PROXY_READY_ATTEMPTS) await delay(PROXY_READY_INTERVAL_MS);
+    }
+    return false;
+}
+
+function describeRequestError(error) {
+    if (!error) return 'unknown error';
+    if (error.code === 'ECONNREFUSED') return 'the proxy is not reachable';
+    if (error.code === 'ETIMEDOUT') return 'the proxy did not answer in time';
+    if (error.code === 'ECONNRESET') return 'the proxy closed the connection';
+    return error.message || String(error);
+}
+
+// Set the model and tell the user when that fails. Never rejects, so no caller can leak a rejection.
+async function trySetModelOnProxy(model) {
+    try {
+        await setModelOnProxy(model);
+        return true;
+    } catch (e) {
+        console.log('[Claude Proxy] Model switch failed:', e && e.message);
+        if (!isDisposed) {
+            vscode.window.showErrorMessage(`Failed to switch model: ${describeRequestError(e)}`);
+        }
+        return false;
+    }
+}
+
+// Proxy is enabled but offline and the user picked a model: start it, wait for it, then set the model
+async function startProxyAndSetModel(model) {
+    const generation = ++modelStartGeneration;
+    // A newer selection, a disable or a deactivate makes this request obsolete
+    const superseded = () => isDisposed || generation !== modelStartGeneration || !isProxyEnabled;
+
+    const startError = await new Promise((resolve) => runPm2Start(resolve));
+    if (superseded()) return;
+    if (startError) {
+        console.log('[Claude Proxy] PM2 start failed:', startError.message);
+        vscode.window.showErrorMessage(isInvalidScriptPath(startError)
+            ? startError.message
+            : `Failed to start proxy. Run: ${PM2_RESTART_COMMAND} (or set "antigravity.proxyScriptPath")`);
+        return;
+    }
+
+    const ready = await waitForProxyReady(superseded);
+    if (superseded()) return;
+    if (!ready) {
+        vscode.window.showErrorMessage('Proxy was started with PM2 but is not responding on localhost:8080 yet. Try again in a moment.');
+        return;
+    }
+
+    await trySetModelOnProxy(model);
+    if (isDisposed) return;
+    // Show the new state now instead of waiting for the next poll
+    checkProxyHealth();
+    fetchProxyQuotaData();
+}
+
+// Flip the enabled flag (persisted for every window) and repaint both status bar items
+function setProxyEnabled(enabled) {
+    isProxyEnabled = enabled;
+    extensionContext.globalState.update('antigravity.proxyEnabled', enabled);
+    if (!enabled) {
+        // Nothing is polled while disabled, so what we knew about the proxy is stale from here on
+        isProxyOnline = false;
+        proxyQuotaData = null;
+        sessionModelSynced = false;
+    }
+    updateModelStatusBar();
+    updateQuotaStatusBar();
 }
 
 // ==================== ACTIVATION ====================
@@ -102,6 +269,14 @@ function activate(context) {
 
     // Store context for workspaceState access in other functions
     extensionContext = context;
+    isDisposed = false;
+    isProxyOnline = false;      // every activation starts offline, so the first answer counts as a reconnect
+    healthCheckInFlight = false;
+    quotaFetchInFlight = false;
+    ideAccountFetchInFlight = false;
+    ideAccountFetchQueued = false;
+    sessionModelSynced = false;
+    sessionResendInFlight = false;
 
     // Load saved proxy enabled state
     const savedProxyEnabled = context.globalState.get('antigravity.proxyEnabled');
@@ -175,12 +350,9 @@ function activate(context) {
                     title: '$(debug-stop) Proxy Disabled'
                 });
                 if (selected && selected.action === 'toggle') {
-                    isProxyEnabled = true;
-                    extensionContext.globalState.update('antigravity.proxyEnabled', true);
-                    startProxyViaPM2();
-                    updateModelStatusBar();
-                    updateQuotaStatusBar();
-                    vscode.window.showInformationMessage('✅ Proxy enabled!');
+                    setProxyEnabled(true);
+                    vscode.window.showInformationMessage('✅ Proxy enabled. Starting it via PM2...');
+                    await startProxyViaPM2();
                 }
                 return;
             }
@@ -191,31 +363,17 @@ function activate(context) {
                     placeHolder: 'Proxy offline - selecting a model will start it',
                     title: '🧠 Switch Model (Proxy Offline)'
                 });
+                if (!selected) return;
 
-                if (selected) {
-                    // Handle toggle action (disable proxy flag)
-                    if (selected.action === 'toggle') {
-                        isProxyEnabled = false;
-                        extensionContext.globalState.update('antigravity.proxyEnabled', false);
-                        updateModelStatusBar();
-                        updateQuotaStatusBar();
-                        vscode.window.showInformationMessage('⏸️ Proxy disabled. Use Antigravity Manager instead.');
-                        return;
-                    }
-
-                    // Start the proxy via PM2 for model selection
-                    exec('pm2 restart antigravity-proxy || pm2 start "' + path.join(os.homedir(), 'Desktop/Projects/Antigravity-Claude-Code-Proxy/Antigravity-Claude-Code-Proxy/src/index.js') + '" --name antigravity-proxy', (error) => {
-                        if (error) {
-                            vscode.window.showErrorMessage('Failed to start proxy. Run: pm2 restart antigravity-proxy');
-                        } else {
-                            vscode.window.showInformationMessage(`Proxy started! Model: ${selected.label}`);
-                            // Wait a moment then set the model
-                            setTimeout(() => {
-                                setModelOnProxy(selected.model);
-                            }, 2000);
-                        }
-                    });
+                // Handle toggle action (disable proxy flag)
+                if (selected.action === 'toggle') {
+                    setProxyEnabled(false);
+                    vscode.window.showInformationMessage('⏸️ Proxy disabled. Use Antigravity Manager instead.');
+                    return;
                 }
+
+                // Start the proxy via PM2, wait until it answers, then set the model
+                await startProxyAndSetModel(selected.model);
                 return;
             }
 
@@ -223,18 +381,13 @@ function activate(context) {
                 placeHolder: `Current: ${getDisplayName(currentModel)}`,
                 title: '🧠 Switch Model'
             });
-            if (selected) {
-                if (selected.action === 'toggle') {
-                    isProxyEnabled = false;
-                    extensionContext.globalState.update('antigravity.proxyEnabled', false);
-                    exec('pm2 stop antigravity-proxy', () => { });
-                    updateModelStatusBar();
-                    updateQuotaStatusBar();
-                    vscode.window.showInformationMessage('⏸️ Proxy stopped. Use Antigravity Manager instead.');
-                    return;
-                }
-                await setModelOnProxy(selected.model);
+            if (!selected) return;
+            if (selected.action === 'toggle') {
+                setProxyEnabled(false);
+                stopProxyViaPM2();
+                return;
             }
+            await trySetModelOnProxy(selected.model);
         })
     );
 
@@ -246,10 +399,16 @@ function activate(context) {
     );
 
     // ==================== POLLING ====================
-    checkProxyHealth();
-    fetchProxyQuotaData();
-    fetchIDEAccount();  // Fetch Antigravity signed-in account
+    // Nothing is polled or looked up while the user has the proxy disabled: port 8080 may then
+    // belong to another tool, and "disabled" must not start any process.
+    if (isProxyEnabled) {
+        refreshProxyState();
+    } else {
+        updateModelStatusBar();
+        updateQuotaStatusBar();
+    }
     pollInterval = setInterval(() => {
+        if (!isProxyEnabled) return;
         checkProxyHealth();
         fetchProxyQuotaData();
     }, PROXY_POLL_INTERVAL_MS);
@@ -290,13 +449,7 @@ function activate(context) {
     //     })
     // );
 
-    context.subscriptions.push({
-        dispose: () => {
-            if (pollInterval) clearInterval(pollInterval);
-            if (accountPollInterval) clearInterval(accountPollInterval);
-            if (settingsWatcher) settingsWatcher.close();
-        }
-    });
+    context.subscriptions.push({ dispose: shutdown });
 }
 
 // ==================== QUOTA STATUS BAR ====================
@@ -321,8 +474,7 @@ function updateQuotaStatusBar() {
 
     // Show account name if available
     if (currentIDEAccount) {
-        const shortEmail = shortEmail(currentIDEAccount.email);
-        quotaStatusBarItem.text = `$(account) ${shortEmail}`;
+        quotaStatusBarItem.text = `$(account) ${shortEmail(currentIDEAccount.email)}`;
     } else {
         quotaStatusBarItem.text = '$(account)';
     }
@@ -338,7 +490,11 @@ async function showQuotaQuickPick() {
         kind: vscode.QuickPickItemKind.Separator
     });
 
-    if (!proxyQuotaData) {
+    if (!isProxyEnabled) {
+        items.push({ label: '$(debug-stop) Proxy disabled', description: 'Enable it from the model menu to see quotas' });
+    } else if (!isProxyOnline) {
+        items.push({ label: '$(warning) Proxy offline', description: 'No quota data available' });
+    } else if (!proxyQuotaData) {
         items.push({ label: '$(sync~spin) Loading quota data...', description: '' });
     } else {
         // Claude quota
@@ -412,56 +568,87 @@ async function showQuotaQuickPick() {
     }
 }
 
-// Fetch Antigravity signed-in account using language server API (like UsageBar)
+// Refresh everything the status bar shows: proxy health, quota and the signed-in account
+function refreshProxyState() {
+    checkProxyHealth();
+    fetchProxyQuotaData();
+    fetchIDEAccount();
+}
+
+// Fetch Antigravity signed-in account using language server API (like UsageBar).
+// Triggered at activation, every 60 s, on window focus and on auth changes. Lookups never overlap;
+// a trigger that arrives while one is running makes it run once more afterwards, so an account
+// switch is not missed.
 async function fetchIDEAccount() {
+    if (isDisposed || !isProxyEnabled) return;
+    if (ideAccountFetchInFlight) {
+        ideAccountFetchQueued = true;
+        return;
+    }
+    ideAccountFetchInFlight = true;
+    let account = null;
     try {
-        // Step 1: Find Antigravity language server process and extract CSRF token
-        const processInfo = await detectAntigravityProcess();
-        if (!processInfo) {
-            currentIDEAccount = null;
-            return;
-        }
-
-        // Step 2: Get listening ports for the process
-        const ports = await getProcessPorts(processInfo.pid);
-        if (ports.length === 0) {
-            console.log('[Claude Proxy] No listening ports found');
-            currentIDEAccount = null;
-            return;
-        }
-
-        // Step 3: Call GetUserStatus API on each port until one works
-        for (const port of ports) {
-            try {
-                const userStatus = await callGetUserStatus(port, processInfo.csrfToken);
-                if (userStatus && userStatus.email) {
-                    console.log(`[Claude Proxy] Found Antigravity account: ${userStatus.email}`);
-                    currentIDEAccount = {
-                        provider: 'antigravity',
-                        email: userStatus.email,
-                        plan: userStatus.plan
-                    };
-                    updateQuotaStatusBar();
-                    return;
-                }
-            } catch (e) {
-                // Try next port
-            }
-        }
-
-        console.log('[Claude Proxy] Could not get user status from any port');
-        currentIDEAccount = null;
+        account = await lookupIDEAccount();
     } catch (e) {
         console.log('[Claude Proxy] Could not fetch Antigravity account:', e.message);
-        currentIDEAccount = null;
+    } finally {
+        ideAccountFetchInFlight = false;
+    }
+    if (isDisposed) return;
+    currentIDEAccount = account;
+    updateQuotaStatusBar();
+
+    if (ideAccountFetchQueued) {
+        ideAccountFetchQueued = false;
+        fetchIDEAccount();
     }
 }
 
-// Detect Antigravity language server process (Windows)
+// Resolves to { provider, email, plan }, or null when no signed-in account can be determined
+async function lookupIDEAccount() {
+    // Step 1: Find Antigravity language server process and extract CSRF token
+    const processInfo = await detectAntigravityProcess();
+    if (!processInfo) return null;
+
+    // Step 2: Get listening ports for the process
+    const ports = await getProcessPorts(processInfo.pid);
+    if (ports.length === 0) {
+        console.log('[Claude Proxy] No listening ports found');
+        return null;
+    }
+
+    // Step 3: Call GetUserStatus API on each port until one works
+    for (const port of ports) {
+        let userStatus = null;
+        try {
+            userStatus = await callGetUserStatus(port, processInfo.csrfToken);
+        } catch (e) {
+            continue;   // Try next port (only request failures are ignored here)
+        }
+        if (userStatus && userStatus.email) {
+            console.log('[Claude Proxy] Found Antigravity account');   // the address itself stays out of the log
+            return {
+                provider: 'antigravity',
+                email: userStatus.email,
+                plan: userStatus.plan
+            };
+        }
+    }
+
+    console.log('[Claude Proxy] Could not get user status from any port');
+    return null;
+}
+
+// Detect Antigravity language server process. Windows only: it relies on wmic, and on other
+// platforms spawning it would just fork a failing shell on every trigger.
 function detectAntigravityProcess() {
     return new Promise((resolve) => {
+        if (process.platform !== 'win32') {
+            resolve(null);
+            return;
+        }
         exec('wmic process where "Name like \'%language_server%\'" get ProcessId,CommandLine /format:list',
-            { timeout: 5000, maxBuffer: 10 * 1024 * 1024 },
+            { timeout: 5000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
             (error, stdout) => {
                 resolve(error ? null : parseWmicOutput(stdout));
             }
@@ -472,13 +659,43 @@ function detectAntigravityProcess() {
 // Get listening ports for a process (Windows)
 function getProcessPorts(pid) {
     return new Promise((resolve) => {
+        // The pid is interpolated into a shell command, so only a plain positive integer is accepted
+        if (!Number.isInteger(pid) || pid <= 0) {
+            resolve([]);
+            return;
+        }
+        // findstr only narrows the output (it matches substrings); parseNetstatPorts keeps the
+        // rows whose PID column is exactly this pid
         exec(`netstat -ano | findstr "${pid}" | findstr "LISTENING"`,
-            { timeout: 5000 },
+            { timeout: 5000, windowsHide: true },
             (error, stdout) => {
-                resolve(error ? [] : parseNetstatPorts(stdout));
+                resolve(error ? [] : parseNetstatPorts(stdout, pid));
             }
         );
     });
+}
+
+// Collect a response body. Rejects when the connection drops before the response completes:
+// in that case Node fires neither the response's 'end' nor the request's 'error', so a promise
+// that only listens for those two would stay pending forever.
+function readBody(res) {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        let ended = false;
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            ended = true;
+            resolve(data);
+        });
+        res.on('error', reject);
+        res.on('close', () => {
+            if (!ended) reject(new Error('Connection closed before the response completed'));
+        });
+    });
+}
+
+function timeoutError() {
+    return Object.assign(new Error('Timeout'), { code: 'ETIMEDOUT' });
 }
 
 // Call GetUserStatus API on the language server
@@ -499,62 +716,34 @@ function callGetUserStatus(port, csrfToken) {
                 'Connect-Protocol-Version': '1',
                 'X-Codeium-Csrf-Token': csrfToken
             },
+            // Loopback-only connection to the IDE's language server, which uses a self-signed certificate
             rejectUnauthorized: false,
             timeout: 3000
         };
 
+        const handleResponse = (res) => {
+            readBody(res).then(data => resolve(parseUserStatusResponse(data))).catch(reject);
+        };
+
         // Try HTTPS first
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const json = JSON.parse(data);
-                    const userStatus = json.userStatus;
-                    if (userStatus) {
-                        const planInfo = userStatus.planStatus?.planInfo;
-                        resolve({
-                            email: userStatus.email,
-                            plan: planInfo?.planDisplayName || planInfo?.planName
-                        });
-                    } else {
-                        resolve(null);
-                    }
-                } catch (e) {
-                    reject(e);
-                }
-            });
-        });
+        const req = https.request(options, handleResponse);
 
         req.on('error', (e) => {
-            // Try HTTP fallback
-            const httpReq = http.request({ ...options, protocol: undefined }, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try {
-                        const json = JSON.parse(data);
-                        const userStatus = json.userStatus;
-                        if (userStatus) {
-                            const planInfo = userStatus.planStatus?.planInfo;
-                            resolve({
-                                email: userStatus.email,
-                                plan: planInfo?.planDisplayName || planInfo?.planName
-                            });
-                        } else {
-                            resolve(null);
-                        }
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-            });
+            if (e && e.code === 'ETIMEDOUT') {
+                // A port that does not answer is not retried over plain HTTP: that would only
+                // send the CSRF token again, in cleartext, after this promise has given up
+                reject(e);
+                return;
+            }
+            // Try HTTP fallback (the language server speaks plain HTTP on some ports)
+            const httpReq = http.request({ ...options, protocol: undefined }, handleResponse);
             httpReq.on('error', reject);
+            httpReq.on('timeout', () => httpReq.destroy(timeoutError()));
             httpReq.write(body);
             httpReq.end();
         });
 
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('timeout', () => req.destroy(timeoutError()));
         req.write(body);
         req.end();
     });
@@ -563,6 +752,10 @@ function callGetUserStatus(port, csrfToken) {
 // ==================== QUOTA DATA ====================
 
 function fetchProxyQuotaData() {
+    if (quotaFetchInFlight) return;     // the previous poll is still running
+    quotaFetchInFlight = true;
+    const done = () => { quotaFetchInFlight = false; };
+
     const req = http.request({
         hostname: 'localhost',
         port: 8080,
@@ -573,6 +766,12 @@ function fetchProxyQuotaData() {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
+            done();
+            if (isDisposed || !isProxyEnabled) return;  // answer arrived after a disable/deactivate
+            if (res.statusCode !== 200) {
+                console.log(`[Claude Proxy] /account-limits answered HTTP ${res.statusCode}; keeping previous quota data`);
+                return;
+            }
             try {
                 const json = JSON.parse(data);
                 proxyQuotaData = processQuotaData(json);
@@ -584,10 +783,13 @@ function fetchProxyQuotaData() {
     });
 
     req.on('error', () => {
+        done();
+        if (isDisposed || !isProxyEnabled) return;
         proxyQuotaData = null;
         updateQuotaStatusBar();
     });
     req.on('timeout', () => req.destroy());
+    req.on('close', done);  // also covers a connection dropped mid-response, where neither of the above fires
     req.end();
 }
 
@@ -610,7 +812,7 @@ function watchClaudeSettings() {
                         console.log(`[Claude Proxy] Detected model change: ${data.model}`);
                         currentModel = data.model;
                         updateModelStatusBar();
-                        setModelOnProxy(data.model);
+                        trySetModelOnProxy(data.model);
                     }
                 } catch (e) {
                     // File being written, ignore
@@ -627,6 +829,18 @@ function watchClaudeSettings() {
 // ==================== PROXY/MODEL FUNCTIONS ====================
 
 function checkProxyHealth() {
+    if (healthCheckInFlight) return;    // the previous poll is still running
+    healthCheckInFlight = true;
+    const done = () => { healthCheckInFlight = false; };
+    const setOnline = (online) => {
+        const cameOnline = online && !isProxyOnline;
+        isProxyOnline = online;
+        if (!online) sessionModelSynced = false;    // a proxy that went away may come back without our model
+        updateModelStatusBar();
+        updateQuotaStatusBar();
+        if (cameOnline) resendWindowModel();
+    };
+
     const req = http.request({
         hostname: 'localhost',
         port: 8080,
@@ -637,43 +851,55 @@ function checkProxyHealth() {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
-            try {
-                const json = JSON.parse(data);
-                isProxyOnline = true;
+            done();
+            if (isDisposed || !isProxyEnabled) return;  // answer arrived after a disable/deactivate
 
-                // Only accept proxy model on FIRST connect if no local model saved
-                // This prevents multiple windows from overwriting each other's model
-                if (json.model && json.model !== currentModel) {
-                    const hasSavedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
-                    if (isFirstConnect && !hasSavedModel) {
-                        console.log(`[Claude Proxy] First connect - using proxy model: ${json.model}`);
-                        currentModel = json.model;
-                    }
-                    // Otherwise, keep local model - don't let proxy override
+            // Only the parse is guarded: an exception in the status bar code below must never be
+            // mistaken for "the proxy is down"
+            // Anything other than HTTP 200 with a JSON object is not our proxy answering normally
+            // (another tool may be listening on 8080)
+            let json = null;
+            if (res.statusCode === 200) {
+                try {
+                    json = JSON.parse(data);
+                } catch (e) {
+                    json = null;
                 }
-                isFirstConnect = false;
-
-                updateModelStatusBar();
-                updateQuotaStatusBar();
-            } catch (e) {
-                isProxyOnline = false;
-                updateModelStatusBar();
-                updateQuotaStatusBar();
             }
+            if (!json || typeof json !== 'object') {
+                setOnline(false);
+                return;
+            }
+
+            // Only accept proxy model on FIRST connect if no local model saved
+            // This prevents multiple windows from overwriting each other's model
+            if (typeof json.model === 'string' && json.model && json.model !== currentModel) {
+                const hasSavedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
+                if (isFirstConnect && !hasSavedModel) {
+                    console.log(`[Claude Proxy] First connect - using proxy model: ${json.model}`);
+                    currentModel = json.model;
+                }
+                // Otherwise, keep local model - don't let proxy override
+            }
+            isFirstConnect = false;
+
+            setOnline(true);
         });
     });
 
     req.on('error', () => {
-        isProxyOnline = false;
-        updateModelStatusBar();
-        updateQuotaStatusBar();
+        done();
+        if (isDisposed || !isProxyEnabled) return;
+        setOnline(false);
     });
     req.on('timeout', () => req.destroy());
+    req.on('close', done);  // also covers a connection dropped mid-response, where neither of the above fires
     req.end();
 }
 
 
-function setModelOnProxy(model) {
+// POST this window's model to the proxy's per-session endpoint. Resolves on HTTP 200.
+function postSessionModel(model) {
     return new Promise((resolve, reject) => {
         // Use session-model endpoint for per-window model isolation
         const postData = JSON.stringify({
@@ -692,29 +918,55 @@ function setModelOnProxy(model) {
             },
             timeout: 5000
         }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
+            readBody(res).then((data) => {
                 if (res.statusCode === 200) {
-                    currentModel = model;
-                    // Save to workspaceState for per-window persistence
-                    if (extensionContext) {
-                        extensionContext.workspaceState.update(WINDOW_MODEL_KEY, model);
-                        console.log(`[Claude Proxy] Saved session model: ${windowId.slice(0, 8)} -> ${model}`);
-                    }
-                    updateModelStatusBar();
-                    vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
                     resolve();
                 } else {
-                    reject(new Error(data));
+                    console.log(`[Claude Proxy] /session-model answered HTTP ${res.statusCode}: ${String(data).slice(0, 200)}`);
+                    reject(new Error(`HTTP ${res.statusCode}`));
                 }
-            });
+            }).catch(reject);
         });
 
         req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('timeout', () => req.destroy(timeoutError()));
         req.write(postData);
         req.end();
+    });
+}
+
+// The user picked a model: send it to the proxy, remember it for this window and show it
+async function setModelOnProxy(model) {
+    await postSessionModel(model);
+    currentModel = model;
+    sessionModelSynced = true;
+    // Save to workspaceState for per-window persistence (also when the window is closing: the
+    // proxy has accepted the model, so the saved state must match)
+    if (extensionContext) {
+        extensionContext.workspaceState.update(WINDOW_MODEL_KEY, model);
+        console.log(`[Claude Proxy] Saved session model: ${windowId.slice(0, 8)} -> ${model}`);
+    }
+    if (!isDisposed) {
+        updateModelStatusBar();
+        vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
+    }
+}
+
+// The proxy keeps per-window (session) models in memory only. After it restarts it no longer knows
+// this window's model, while the status bar still shows the saved one. Called when the proxy goes
+// from offline to online: quietly send the saved model again. One attempt per reconnect, and a
+// failure is only logged, because the user did not ask for anything.
+function resendWindowModel() {
+    const savedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
+    if (!savedModel || sessionModelSynced || sessionResendInFlight) return;
+    sessionResendInFlight = true;
+    postSessionModel(savedModel).then(() => {
+        sessionModelSynced = true;
+        console.log(`[Claude Proxy] Re-sent session model after reconnect: ${windowId.slice(0, 8)} -> ${savedModel}`);
+    }, (e) => {
+        console.log('[Claude Proxy] Could not re-send session model after reconnect:', e && e.message);
+    }).finally(() => {
+        sessionResendInFlight = false;
     });
 }
 
@@ -742,9 +994,30 @@ function updateModelStatusBar() {
 
 // ==================== DEACTIVATION ====================
 
-function deactivate() {
+function clearTimers() {
     if (pollInterval) clearInterval(pollInterval);
     if (accountPollInterval) clearInterval(accountPollInterval);
+    pollInterval = null;
+    accountPollInterval = null;
+}
+
+// Runs from deactivate() and again when the subscriptions are disposed; safe to call twice.
+// Requests and timers that are still in flight see isDisposed and leave the UI and the user alone.
+function shutdown() {
+    isDisposed = true;
+    modelStartGeneration++;     // cancels a pending "start the proxy, then set the model"
+    clearTimers();
+    if (settingsWatcher) {
+        settingsWatcher.close();
+        settingsWatcher = null;
+    }
+    // The items themselves are disposed by VS Code (they are in context.subscriptions)
+    quotaStatusBarItem = null;
+    modelStatusBarItem = null;
+}
+
+function deactivate() {
+    shutdown();
     console.log('[Claude Proxy] Extension deactivated');
 }
 
