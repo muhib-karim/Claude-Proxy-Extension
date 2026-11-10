@@ -196,3 +196,45 @@ test('parseNetstatPorts keeps only rows owned by the exact PID', () => {
     // Without a pid every listening port is returned
     assert.deepEqual(q.parseNetstatPorts(out), [4242, 42100, 42101, 53000, 61000]);
 });
+
+test('processQuotaData skips malformed account entries instead of throwing', () => {
+    const r = q.processQuotaData({
+        accounts: [
+            null,
+            'junk',
+            { email: 'bad-limits@x', status: 'ok', limits: 'nope' },
+            { email: 'ok@x', status: 'ok', limits: { 'claude-a': { remainingFraction: 0.4 } } }
+        ]
+    });
+    assert.equal(r.claudeQuota, 40);
+    assert.deepEqual(r.accounts.map(a => a.email), ['ok@x']);
+});
+
+test('non-numeric remaining fractions count as unknown, never NaN', () => {
+    const r = q.processQuotaData({
+        accounts: [{
+            email: 'a@x', status: 'ok', limits: {
+                'claude-a': { remainingFraction: 'abc' },
+                'claude-b': { remainingFraction: '0.5' },
+                'gemini-a': { remainingFraction: {} },
+                'gemini-b': { remainingFraction: '' }
+            }
+        }]
+    });
+    assert.equal(r.claudeQuota, 50);
+    assert.deepEqual(r.claudeModels, [{ id: 'claude-b', quota: 50 }]);
+    assert.equal(r.geminiQuota, null);
+    assert.deepEqual(q.summarizeAccountLimits({ 'claude-a': { remainingFraction: 'abc' } }),
+        { claudePct: null, geminiPct: null, claudeReset: null, geminiReset: null });
+});
+
+test('getDisplayName tolerates non-string model values', () => {
+    for (const value of [undefined, null, 123, {}, []]) {
+        assert.equal(q.getDisplayName(value), '❓');
+    }
+});
+
+test('sortAccountsByClaudeQuota tolerates a missing list and entries without limits', () => {
+    assert.deepEqual(q.sortAccountsByClaudeQuota(undefined), []);
+    assert.deepEqual(q.sortAccountsByClaudeQuota([{ email: 'a@x' }, null]).map(a => a.claudePct), [null, null]);
+});
