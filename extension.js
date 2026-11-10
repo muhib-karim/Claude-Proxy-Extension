@@ -321,8 +321,7 @@ function updateQuotaStatusBar() {
 
     // Show account name if available
     if (currentIDEAccount) {
-        const shortEmail = shortEmail(currentIDEAccount.email);
-        quotaStatusBarItem.text = `$(account) ${shortEmail}`;
+        quotaStatusBarItem.text = `$(account) ${shortEmail(currentIDEAccount.email)}`;
     } else {
         quotaStatusBarItem.text = '$(account)';
     }
@@ -432,20 +431,21 @@ async function fetchIDEAccount() {
 
         // Step 3: Call GetUserStatus API on each port until one works
         for (const port of ports) {
+            let userStatus = null;
             try {
-                const userStatus = await callGetUserStatus(port, processInfo.csrfToken);
-                if (userStatus && userStatus.email) {
-                    console.log(`[Claude Proxy] Found Antigravity account: ${userStatus.email}`);
-                    currentIDEAccount = {
-                        provider: 'antigravity',
-                        email: userStatus.email,
-                        plan: userStatus.plan
-                    };
-                    updateQuotaStatusBar();
-                    return;
-                }
+                userStatus = await callGetUserStatus(port, processInfo.csrfToken);
             } catch (e) {
-                // Try next port
+                continue;   // Try next port (only request failures are ignored here)
+            }
+            if (userStatus && userStatus.email) {
+                console.log(`[Claude Proxy] Found Antigravity account: ${userStatus.email}`);
+                currentIDEAccount = {
+                    provider: 'antigravity',
+                    email: userStatus.email,
+                    plan: userStatus.plan
+                };
+                updateQuotaStatusBar();
+                return;
             }
         }
 
@@ -637,29 +637,37 @@ function checkProxyHealth() {
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
+            // Only the parse is guarded: an exception in the status bar code below must never be
+            // mistaken for "the proxy is down"
+            let json = null;
             try {
-                const json = JSON.parse(data);
-                isProxyOnline = true;
-
-                // Only accept proxy model on FIRST connect if no local model saved
-                // This prevents multiple windows from overwriting each other's model
-                if (json.model && json.model !== currentModel) {
-                    const hasSavedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
-                    if (isFirstConnect && !hasSavedModel) {
-                        console.log(`[Claude Proxy] First connect - using proxy model: ${json.model}`);
-                        currentModel = json.model;
-                    }
-                    // Otherwise, keep local model - don't let proxy override
-                }
-                isFirstConnect = false;
-
-                updateModelStatusBar();
-                updateQuotaStatusBar();
+                json = JSON.parse(data);
             } catch (e) {
+                json = null;
+            }
+            if (!json) {
                 isProxyOnline = false;
                 updateModelStatusBar();
                 updateQuotaStatusBar();
+                return;
             }
+
+            isProxyOnline = true;
+
+            // Only accept proxy model on FIRST connect if no local model saved
+            // This prevents multiple windows from overwriting each other's model
+            if (json.model && json.model !== currentModel) {
+                const hasSavedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
+                if (isFirstConnect && !hasSavedModel) {
+                    console.log(`[Claude Proxy] First connect - using proxy model: ${json.model}`);
+                    currentModel = json.model;
+                }
+                // Otherwise, keep local model - don't let proxy override
+            }
+            isFirstConnect = false;
+
+            updateModelStatusBar();
+            updateQuotaStatusBar();
         });
     });
 

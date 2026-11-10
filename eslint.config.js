@@ -12,7 +12,10 @@ module.exports = [
             globals: { ...globals.node }
         },
         rules: {
-            'no-unused-vars': ['error', { args: 'none', caughtErrors: 'none' }]
+            'no-unused-vars': ['error', { args: 'none', caughtErrors: 'none' }],
+            // Catches `const x = x(...)`, where a local shadows an import and throws at runtime.
+            // Function declarations are hoisted, so calling them before their definition is fine.
+            'no-use-before-define': ['error', { functions: false, classes: true, variables: true }]
         }
     }
 ];
