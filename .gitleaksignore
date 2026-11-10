@@ -1,0 +1,11 @@
+# gitleaks ignore list. One fingerprint per line: <commit>:<file>:<rule>:<line>
+#
+# Historical finding only. The file belonged to extracted-3.3.0/, an unpacked copy of an old VSIX
+# that was committed by mistake and removed from the tree in 8d7ae4e. The flagged value is Google's
+# public OAuth client value for the Antigravity "installed application" flow, identical to the one
+# the upstream antigravity-claude-proxy project publishes in src/constants.js. It is not a
+# credential owned by this project, and the current code contains no OAuth client at all.
+#
+# The fingerprint includes the rule id, so re-check this entry when the gitleaks version pinned in
+# .github/workflows/ci.yml changes.
+3b3f8301bd4ea8e6cffef68db78dddf579bf0d51:extracted-3.3.0/extension/extension.js:generic-api-key:36

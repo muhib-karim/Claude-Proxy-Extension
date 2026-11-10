@@ -147,3 +147,29 @@ test('verify:package pipes a pinned vsce ls through the check script', () => {
     assert.match(manifest.scripts['verify:package'],
         /^npx --yes @vscode\/vsce@\d+\.\d+\.\d+ ls \| node scripts\/check-vsix-files\.js$/);
 });
+
+// ---------- CI and secret scanning ----------
+
+test('CI pins every action to a commit, checks the package and never publishes', () => {
+    const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+    const uses = [...workflow.matchAll(/^\s*-?\s*uses:\s*(\S+)/gm)].map((m) => m[1]);
+    assert.ok(uses.length >= 4);
+    for (const action of uses) {
+        assert.match(action, /^[\w.-]+\/[\w.-]+@[0-9a-f]{40}$/, `${action} is pinned to a full commit SHA`);
+    }
+    assert.match(workflow, /node-version: \[20, 22\]/);
+    assert.match(workflow, /npm run verify:package/);
+    assert.match(workflow, /vsce@\d+\.\d+\.\d+ package --out/);
+    assert.match(workflow, /gitleaks" git /);
+    assert.doesNotMatch(workflow, /ovsx|vsce(@[\d.]+)? publish/, 'CI must never publish');
+});
+
+test('.gitleaksignore holds only the documented historical fingerprint', () => {
+    const lines = fs.readFileSync(path.join(ROOT, '.gitleaksignore'), 'utf8')
+        .split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    assert.deepEqual(lines, [
+        '3b3f8301bd4ea8e6cffef68db78dddf579bf0d51:extracted-3.3.0/extension/extension.js:generic-api-key:36'
+    ]);
+    // The ignored path must stay deleted from the tree
+    assert.equal(fs.existsSync(path.join(ROOT, 'extracted-3.3.0')), false);
+});
