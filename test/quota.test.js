@@ -238,3 +238,15 @@ test('sortAccountsByClaudeQuota tolerates a missing list and entries without lim
     assert.deepEqual(q.sortAccountsByClaudeQuota(undefined), []);
     assert.deepEqual(q.sortAccountsByClaudeQuota([{ email: 'a@x' }, null]).map(a => a.claudePct), [null, null]);
 });
+
+test('parseUserStatusResponse reads the email and plan name', () => {
+    const body = JSON.stringify({
+        userStatus: { email: 'me@example.com', planStatus: { planInfo: { planName: 'pro', planDisplayName: 'Pro' } } }
+    });
+    assert.deepEqual(q.parseUserStatusResponse(body), { email: 'me@example.com', plan: 'Pro' });
+    assert.deepEqual(q.parseUserStatusResponse(JSON.stringify({ userStatus: { email: 'x@example.com' } })),
+        { email: 'x@example.com', plan: undefined });
+    assert.equal(q.parseUserStatusResponse('{}'), null);
+    assert.equal(q.parseUserStatusResponse('null'), null);
+    assert.throws(() => q.parseUserStatusResponse('<html>'), SyntaxError);
+});

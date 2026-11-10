@@ -108,3 +108,80 @@ test('the CSRF token is only sent to ports owned by the language server PID', as
         assert.deepEqual(tokenPorts, [53000]);
     });
 });
+
+// ---------- B4 / B17: language server requests must always settle ----------
+
+// The language server listens on two ports; the lookup tries them in ascending order
+const NETSTAT_TWO_PORTS = [
+    '  TCP    127.0.0.1:53021        0.0.0.0:0              LISTENING       4242',
+    '  TCP    127.0.0.1:53022        0.0.0.0:0              LISTENING       4242'
+].join('\r\n');
+const TLS_ERROR = () => Object.assign(new Error('wrong version number'), { code: 'EPROTO' });
+const aliceStatus = languageServer()[GET_USER_STATUS];
+
+test('every request the extension sends has a timeout handler', async () => {
+    const up = proxyUp({ [GET_USER_STATUS]: aliceStatus });
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, exec: windowsTools(),
+        https: () => TLS_ERROR(),          // plain-HTTP port: the extension falls back to http
+        http: up
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.requests('http', GET_USER_STATUS).length > 0, 'HTTP fallback request');
+        await h.settle();
+        const missing = h.state.requests.filter((r) => !r.hasTimeoutHandler).map((r) => `${r.kind} ${r.path}`);
+        assert.deepEqual(missing, []);
+    });
+});
+
+test('a silent HTTP fallback port does not hang the account lookup', async () => {
+    const up = proxyUp();
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, exec: windowsTools({ netstat: NETSTAT_TWO_PORTS }),
+        https: (record) => (record.port === 53021 ? TLS_ERROR() : aliceStatus),
+        http: (record) => (record.path === GET_USER_STATUS ? 'timeout' : up[record.path])
+    }, async (h) => {
+        h.activate();
+        // Port 53021 never answers the fallback; the lookup must give up on it and try 53022
+        await h.waitFor(() => h.quotaItem.text === '$(account) alice', 'account found on the second port');
+    });
+});
+
+test('after an HTTPS timeout the token is not re-sent over plain HTTP', async () => {
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, exec: windowsTools(), http: proxyUp(),
+        https: { [GET_USER_STATUS]: 'timeout' }
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.requests('https', GET_USER_STATUS).some((r) => r.destroyed), 'HTTPS request timed out');
+        await h.settle();
+        assert.equal(h.requests('http', GET_USER_STATUS).length, 0);
+    });
+});
+
+test('a language server response that is cut off mid-body does not hang the account lookup', async () => {
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, exec: windowsTools({ netstat: NETSTAT_TWO_PORTS }), http: proxyUp(),
+        https: (record) => (record.port === 53021 ? { body: '{"userStatus":', abort: true } : aliceStatus)
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.quotaItem.text === '$(account) alice', 'account found on the second port');
+    });
+});
+
+test('a model switch settles when the proxy drops the connection mid-response', async () => {
+    await withHarness({
+        globalState: ENABLED,
+        http: proxyUp({ '/session-model': { body: '{"ok":', abort: true } }),
+        pick: (items) => items.find((i) => i.model === 'claude-opus-4-5-thinking')
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+        const outcome = await Promise.race([
+            h.command('antigravity.switchModel').then(() => 'settled', () => 'settled'),
+            h.settle(200).then(() => 'pending')
+        ]);
+        assert.equal(outcome, 'settled', 'the command must not stay pending forever');
+        assert.equal(h.modelItem.text, '⚡ Flash', 'the model is unchanged');
+    });
+});

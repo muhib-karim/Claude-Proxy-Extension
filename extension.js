@@ -15,7 +15,8 @@ const {
     formatResetTime,
     getDisplayName,
     parseWmicOutput,
-    parseNetstatPorts
+    parseNetstatPorts,
+    parseUserStatusResponse
 } = require('./lib/quota');
 
 // ==================== STATE ====================
@@ -488,6 +489,29 @@ function getProcessPorts(pid) {
     });
 }
 
+// Collect a response body. Rejects when the connection drops before the response completes:
+// in that case Node fires neither the response's 'end' nor the request's 'error', so a promise
+// that only listens for those two would stay pending forever.
+function readBody(res) {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        let ended = false;
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            ended = true;
+            resolve(data);
+        });
+        res.on('error', reject);
+        res.on('close', () => {
+            if (!ended) reject(new Error('Connection closed before the response completed'));
+        });
+    });
+}
+
+function timeoutError() {
+    return Object.assign(new Error('Timeout'), { code: 'ETIMEDOUT' });
+}
+
 // Call GetUserStatus API on the language server
 function callGetUserStatus(port, csrfToken) {
     return new Promise((resolve, reject) => {
@@ -506,62 +530,34 @@ function callGetUserStatus(port, csrfToken) {
                 'Connect-Protocol-Version': '1',
                 'X-Codeium-Csrf-Token': csrfToken
             },
+            // Loopback-only connection to the IDE's language server, which uses a self-signed certificate
             rejectUnauthorized: false,
             timeout: 3000
         };
 
+        const handleResponse = (res) => {
+            readBody(res).then(data => resolve(parseUserStatusResponse(data))).catch(reject);
+        };
+
         // Try HTTPS first
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const json = JSON.parse(data);
-                    const userStatus = json.userStatus;
-                    if (userStatus) {
-                        const planInfo = userStatus.planStatus?.planInfo;
-                        resolve({
-                            email: userStatus.email,
-                            plan: planInfo?.planDisplayName || planInfo?.planName
-                        });
-                    } else {
-                        resolve(null);
-                    }
-                } catch (e) {
-                    reject(e);
-                }
-            });
-        });
+        const req = https.request(options, handleResponse);
 
         req.on('error', (e) => {
-            // Try HTTP fallback
-            const httpReq = http.request({ ...options, protocol: undefined }, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try {
-                        const json = JSON.parse(data);
-                        const userStatus = json.userStatus;
-                        if (userStatus) {
-                            const planInfo = userStatus.planStatus?.planInfo;
-                            resolve({
-                                email: userStatus.email,
-                                plan: planInfo?.planDisplayName || planInfo?.planName
-                            });
-                        } else {
-                            resolve(null);
-                        }
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-            });
+            if (e && e.code === 'ETIMEDOUT') {
+                // A port that does not answer is not retried over plain HTTP: that would only
+                // send the CSRF token again, in cleartext, after this promise has given up
+                reject(e);
+                return;
+            }
+            // Try HTTP fallback (the language server speaks plain HTTP on some ports)
+            const httpReq = http.request({ ...options, protocol: undefined }, handleResponse);
             httpReq.on('error', reject);
+            httpReq.on('timeout', () => httpReq.destroy(timeoutError()));
             httpReq.write(body);
             httpReq.end();
         });
 
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('timeout', () => req.destroy(timeoutError()));
         req.write(body);
         req.end();
     });
@@ -707,9 +703,7 @@ function setModelOnProxy(model) {
             },
             timeout: 5000
         }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
+            readBody(res).then((data) => {
                 if (res.statusCode === 200) {
                     currentModel = model;
                     // Save to workspaceState for per-window persistence
@@ -723,11 +717,11 @@ function setModelOnProxy(model) {
                 } else {
                     reject(new Error(data));
                 }
-            });
+            }).catch(reject);
         });
 
         req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('timeout', () => req.destroy(timeoutError()));
         req.write(postData);
         req.end();
     });
