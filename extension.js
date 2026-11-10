@@ -240,6 +240,7 @@ async function startProxyAndSetModel(model) {
     }
 
     await trySetModelOnProxy(model);
+    if (isDisposed) return;
     // Show the new state now instead of waiting for the next poll
     checkProxyHealth();
     fetchProxyQuotaData();
@@ -268,6 +269,7 @@ function activate(context) {
     // Store context for workspaceState access in other functions
     extensionContext = context;
     isDisposed = false;
+    isProxyOnline = false;      // every activation starts offline, so the first answer counts as a reconnect
     healthCheckInFlight = false;
     quotaFetchInFlight = false;
     ideAccountFetchInFlight = false;
