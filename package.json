@@ -30,7 +30,7 @@
     "main": "./extension.js",
     "scripts": {
         "lint": "eslint .",
-        "test": "node --test test/quota.test.js test/extension.test.js test/extension.behavior.test.js test/package-files.test.js",
+        "test": "node --test test/quota.test.js test/pm2.test.js test/extension.test.js test/extension.behavior.test.js test/package-files.test.js",
         "check": "npm run lint && npm test"
     },
     "contributes": {
@@ -47,7 +47,18 @@
                 "command": "antigravity.showQuotaInfo",
                 "title": "Antigravity: Show Quota Info"
             }
-        ]
+        ],
+        "configuration": {
+            "title": "Antigravity Proxy Status",
+            "properties": {
+                "antigravity.proxyScriptPath": {
+                    "type": "string",
+                    "default": "",
+                    "scope": "machine",
+                    "markdownDescription": "Absolute path to the proxy's entry script (for example `/home/me/proxy/src/index.js`). Only used as a fallback: when `pm2 restart antigravity-proxy` fails because the proxy is not registered with PM2 yet, the extension runs `pm2 start <path> --name antigravity-proxy`. Leave empty to only use `pm2 restart`."
+                }
+            }
+        }
     },
     "homepage": "https://open-vsx.org/extension/ai-dev-2024/claude-proxy-status",
     "bugs": {

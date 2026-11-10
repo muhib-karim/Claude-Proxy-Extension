@@ -18,6 +18,7 @@ const {
     parseNetstatPorts,
     parseUserStatusResponse
 } = require('./lib/quota');
+const { PM2_RESTART_COMMAND, PM2_STOP_COMMAND, buildPm2StartCommand } = require('./lib/pm2');
 
 // ==================== STATE ====================
 let quotaStatusBarItem = null;        // Shows quota summary on hover
@@ -30,6 +31,8 @@ let accountPollInterval = null;
 let settingsWatcher = null;           // File watcher for Claude Code settings
 let proxyQuotaData = null;            // Quota data from proxy /account-limits
 let currentIDEAccount = null;         // Antigravity signed-in account
+let isDisposed = false;               // Set on deactivate: late callbacks must not touch the UI
+let modelStartGeneration = 0;         // Bumped by every "start the proxy, then set the model" request
 
 // Per-window model persistence
 let extensionContext = null;          // Store context for workspaceState access
@@ -43,7 +46,38 @@ const ACCOUNT_POLL_INTERVAL_MS = 60 * 1000;  // 60 seconds - refresh account fre
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 
 
-// ==================== PROXY AUTO-START ====================
+// ==================== PROXY START / STOP (PM2) ====================
+
+// PM2 goes through a shell (pm2 is a .cmd shim on Windows). A hung pm2 must not block forever,
+// and no console window should flash on Windows.
+const PM2_EXEC_OPTIONS = { timeout: 20000, windowsHide: true };
+const PM2_START_HINT = 'Register the proxy once with "pm2 start <proxy-script> --name antigravity-proxy", or set "antigravity.proxyScriptPath".';
+
+// A freshly (re)started proxy gets this long to accept connections
+const PROXY_READY_ATTEMPTS = 20;
+const PROXY_READY_INTERVAL_MS = 500;
+
+function runPm2(command, callback) {
+    exec(command, PM2_EXEC_OPTIONS, (error) => callback(error || null));
+}
+
+// `pm2 restart antigravity-proxy`, falling back to `pm2 start <antigravity.proxyScriptPath>` when
+// that setting is configured (the proxy may not be registered with PM2 yet)
+function runPm2Start(callback) {
+    let command;
+    try {
+        const scriptPath = vscode.workspace.getConfiguration('antigravity').get('proxyScriptPath', '');
+        command = buildPm2StartCommand(scriptPath);
+    } catch (e) {
+        callback(e);    // invalid setting: nothing is executed
+        return;
+    }
+    runPm2(command, callback);
+}
+
+function isInvalidScriptPath(error) {
+    return !!error && /^Invalid antigravity\.proxyScriptPath/.test(error.message);
+}
 
 // Ensure proxy is running - called on extension activation
 function ensureProxyRunning() {
@@ -63,10 +97,9 @@ function ensureProxyRunning() {
     req.on('error', () => {
         // Proxy is not running, try to start it via PM2
         console.log('[Claude Proxy] Proxy offline, attempting PM2 restart...');
-        // Use pm2 restart (assumes proxy was previously registered with PM2)
-        exec('pm2 restart antigravity-proxy', (error) => {
+        runPm2Start((error) => {
             if (error) {
-                console.log('[Claude Proxy] PM2 restart failed. Please run: pm2 start <proxy-path> --name antigravity-proxy');
+                console.log(`[Claude Proxy] PM2 restart failed (${error.message}). ${PM2_START_HINT}`);
             } else {
                 console.log('[Claude Proxy] Proxy started successfully via PM2');
             }
@@ -80,19 +113,125 @@ function ensureProxyRunning() {
     req.end();
 }
 
-// Direct PM2 start - called when user clicks Enable or to recover crashed proxy
+// Start the proxy after the user enabled it
 function startProxyViaPM2() {
-
     console.log('[Claude Proxy] Starting proxy via PM2...');
-    // Try restart first (works if process exists in PM2)
-    exec('pm2 restart antigravity-proxy', (restartErr) => {
-        if (restartErr) {
-            console.log('[Claude Proxy] PM2 restart failed. Proxy may not be registered.');
-            vscode.window.showWarningMessage('Proxy not found in PM2. Please run setup: scripts/setup/SETUP_STARTUP.bat');
+    runPm2Start((error) => {
+        if (isDisposed) return;
+        if (error) {
+            console.log('[Claude Proxy] PM2 start failed:', error.message);
+            vscode.window.showWarningMessage(isInvalidScriptPath(error)
+                ? error.message
+                : `Could not start the proxy with PM2. ${PM2_START_HINT}`);
         } else {
             console.log('[Claude Proxy] Proxy restarted via PM2');
         }
     });
+}
+
+// Stop the proxy after the user disabled it, and say what really happened
+function stopProxyViaPM2() {
+    runPm2(PM2_STOP_COMMAND, (error) => {
+        if (isDisposed) return;
+        if (error) {
+            console.log('[Claude Proxy] PM2 stop failed:', error.message);
+            vscode.window.showWarningMessage(`Proxy disabled, but PM2 could not stop it. Run: ${PM2_STOP_COMMAND}`);
+        } else {
+            vscode.window.showInformationMessage('⏸️ Proxy stopped. Use Antigravity Manager instead.');
+        }
+    });
+}
+
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// One GET /health. Any HTTP answer means the proxy is listening.
+function probeProxyHealth() {
+    return new Promise((resolve) => {
+        const req = http.request({
+            hostname: 'localhost',
+            port: 8080,
+            path: '/health',
+            method: 'GET',
+            timeout: 1000
+        }, (res) => {
+            res.resume();
+            resolve(true);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => req.destroy());
+        req.end();
+    });
+}
+
+// Wait until a freshly (re)started proxy accepts connections. Bounded by attempt count, so it
+// always ends; `isCancelled` stops it early.
+async function waitForProxyReady(isCancelled) {
+    for (let attempt = 1; attempt <= PROXY_READY_ATTEMPTS; attempt++) {
+        if (isCancelled()) return false;
+        if (await probeProxyHealth()) return true;
+        if (attempt < PROXY_READY_ATTEMPTS) await delay(PROXY_READY_INTERVAL_MS);
+    }
+    return false;
+}
+
+function describeRequestError(error) {
+    if (!error) return 'unknown error';
+    if (error.code === 'ECONNREFUSED') return 'the proxy is not reachable';
+    if (error.code === 'ETIMEDOUT') return 'the proxy did not answer in time';
+    return error.message || String(error);
+}
+
+// Set the model and tell the user when that fails. Never rejects, so no caller can leak a rejection.
+async function trySetModelOnProxy(model) {
+    try {
+        await setModelOnProxy(model);
+        return true;
+    } catch (e) {
+        console.log('[Claude Proxy] Model switch failed:', e && e.message);
+        if (!isDisposed) {
+            vscode.window.showErrorMessage(`Failed to switch model: ${describeRequestError(e)}`);
+        }
+        return false;
+    }
+}
+
+// Proxy is enabled but offline and the user picked a model: start it, wait for it, then set the model
+async function startProxyAndSetModel(model) {
+    const generation = ++modelStartGeneration;
+    // A newer selection, a disable or a deactivate makes this request obsolete
+    const superseded = () => isDisposed || generation !== modelStartGeneration || !isProxyEnabled;
+
+    const startError = await new Promise((resolve) => runPm2Start(resolve));
+    if (superseded()) return;
+    if (startError) {
+        console.log('[Claude Proxy] PM2 start failed:', startError.message);
+        vscode.window.showErrorMessage(isInvalidScriptPath(startError)
+            ? startError.message
+            : `Failed to start proxy. Run: ${PM2_RESTART_COMMAND} (or set "antigravity.proxyScriptPath")`);
+        return;
+    }
+
+    const ready = await waitForProxyReady(superseded);
+    if (superseded()) return;
+    if (!ready) {
+        vscode.window.showErrorMessage('Proxy was started with PM2 but is not responding on localhost:8080 yet. Try again in a moment.');
+        return;
+    }
+
+    await trySetModelOnProxy(model);
+    // Show the new state now instead of waiting for the next poll
+    checkProxyHealth();
+    fetchProxyQuotaData();
+}
+
+// Flip the enabled flag (persisted for every window) and repaint both status bar items
+function setProxyEnabled(enabled) {
+    isProxyEnabled = enabled;
+    extensionContext.globalState.update('antigravity.proxyEnabled', enabled);
+    updateModelStatusBar();
+    updateQuotaStatusBar();
 }
 
 // ==================== ACTIVATION ====================
@@ -103,6 +242,7 @@ function activate(context) {
 
     // Store context for workspaceState access in other functions
     extensionContext = context;
+    isDisposed = false;
 
     // Load saved proxy enabled state
     const savedProxyEnabled = context.globalState.get('antigravity.proxyEnabled');
@@ -176,12 +316,9 @@ function activate(context) {
                     title: '$(debug-stop) Proxy Disabled'
                 });
                 if (selected && selected.action === 'toggle') {
-                    isProxyEnabled = true;
-                    extensionContext.globalState.update('antigravity.proxyEnabled', true);
+                    setProxyEnabled(true);
+                    vscode.window.showInformationMessage('✅ Proxy enabled. Starting it via PM2...');
                     startProxyViaPM2();
-                    updateModelStatusBar();
-                    updateQuotaStatusBar();
-                    vscode.window.showInformationMessage('✅ Proxy enabled!');
                 }
                 return;
             }
@@ -192,31 +329,17 @@ function activate(context) {
                     placeHolder: 'Proxy offline - selecting a model will start it',
                     title: '🧠 Switch Model (Proxy Offline)'
                 });
+                if (!selected) return;
 
-                if (selected) {
-                    // Handle toggle action (disable proxy flag)
-                    if (selected.action === 'toggle') {
-                        isProxyEnabled = false;
-                        extensionContext.globalState.update('antigravity.proxyEnabled', false);
-                        updateModelStatusBar();
-                        updateQuotaStatusBar();
-                        vscode.window.showInformationMessage('⏸️ Proxy disabled. Use Antigravity Manager instead.');
-                        return;
-                    }
-
-                    // Start the proxy via PM2 for model selection
-                    exec('pm2 restart antigravity-proxy || pm2 start "' + path.join(os.homedir(), 'Desktop/Projects/Antigravity-Claude-Code-Proxy/Antigravity-Claude-Code-Proxy/src/index.js') + '" --name antigravity-proxy', (error) => {
-                        if (error) {
-                            vscode.window.showErrorMessage('Failed to start proxy. Run: pm2 restart antigravity-proxy');
-                        } else {
-                            vscode.window.showInformationMessage(`Proxy started! Model: ${selected.label}`);
-                            // Wait a moment then set the model
-                            setTimeout(() => {
-                                setModelOnProxy(selected.model);
-                            }, 2000);
-                        }
-                    });
+                // Handle toggle action (disable proxy flag)
+                if (selected.action === 'toggle') {
+                    setProxyEnabled(false);
+                    vscode.window.showInformationMessage('⏸️ Proxy disabled. Use Antigravity Manager instead.');
+                    return;
                 }
+
+                // Start the proxy via PM2, wait until it answers, then set the model
+                await startProxyAndSetModel(selected.model);
                 return;
             }
 
@@ -224,18 +347,13 @@ function activate(context) {
                 placeHolder: `Current: ${getDisplayName(currentModel)}`,
                 title: '🧠 Switch Model'
             });
-            if (selected) {
-                if (selected.action === 'toggle') {
-                    isProxyEnabled = false;
-                    extensionContext.globalState.update('antigravity.proxyEnabled', false);
-                    exec('pm2 stop antigravity-proxy', () => { });
-                    updateModelStatusBar();
-                    updateQuotaStatusBar();
-                    vscode.window.showInformationMessage('⏸️ Proxy stopped. Use Antigravity Manager instead.');
-                    return;
-                }
-                await setModelOnProxy(selected.model);
+            if (!selected) return;
+            if (selected.action === 'toggle') {
+                setProxyEnabled(false);
+                stopProxyViaPM2();
+                return;
             }
+            await trySetModelOnProxy(selected.model);
         })
     );
 
@@ -293,6 +411,7 @@ function activate(context) {
 
     context.subscriptions.push({
         dispose: () => {
+            isDisposed = true;
             if (pollInterval) clearInterval(pollInterval);
             if (accountPollInterval) clearInterval(accountPollInterval);
             if (settingsWatcher) settingsWatcher.close();
@@ -613,7 +732,7 @@ function watchClaudeSettings() {
                         console.log(`[Claude Proxy] Detected model change: ${data.model}`);
                         currentModel = data.model;
                         updateModelStatusBar();
-                        setModelOnProxy(data.model);
+                        trySetModelOnProxy(data.model);
                     }
                 } catch (e) {
                     // File being written, ignore
@@ -715,7 +834,8 @@ function setModelOnProxy(model) {
                     vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
                     resolve();
                 } else {
-                    reject(new Error(data));
+                    console.log(`[Claude Proxy] /session-model answered HTTP ${res.statusCode}: ${String(data).slice(0, 200)}`);
+                    reject(new Error(`HTTP ${res.statusCode}`));
                 }
             }).catch(reject);
         });
@@ -752,6 +872,7 @@ function updateModelStatusBar() {
 // ==================== DEACTIVATION ====================
 
 function deactivate() {
+    isDisposed = true;
     if (pollInterval) clearInterval(pollInterval);
     if (accountPollInterval) clearInterval(accountPollInterval);
     console.log('[Claude Proxy] Extension deactivated');

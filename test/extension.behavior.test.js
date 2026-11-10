@@ -183,5 +183,204 @@ test('a model switch settles when the proxy drops the connection mid-response', 
         ]);
         assert.equal(outcome, 'settled', 'the command must not stay pending forever');
         assert.equal(h.modelItem.text, '⚡ Flash', 'the model is unchanged');
+        assert.ok(h.messages('error').some((m) => m.startsWith('Failed to switch model')));
+    });
+});
+
+// ---------- B5 / B6 / B15: PM2 control and model switching ----------
+
+const OPUS = 'claude-opus-4-5-thinking';
+const pickModel = (model) => (items) => items.find((i) => i.model === model);
+const pickToggle = (items) => items[0];
+const pm2Commands = (h) => h.execs('pm2').map((e) => e.command);
+
+test('offline: picking a model restarts the proxy, waits until it answers, then sets the model', async () => {
+    const routes = proxyUp();
+    let phase = 'down';             // 'down' -> 'starting' -> 'up'
+    let probesWhileStarting = 0;
+    await withHarness({
+        globalState: ENABLED, fastTimers: true, pick: pickModel(OPUS),
+        exec: (command) => (command.startsWith('pm2') ? 'ok' : null),
+        http: (record) => {
+            if (phase === 'up') return routes[record.path];
+            if (phase === 'starting' && record.path === '/health' && ++probesWhileStarting >= 3) {
+                phase = 'up';       // the proxy needs a moment after `pm2 restart` returns
+                return routes['/health'];
+            }
+            return 'refuse';
+        }
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+
+        phase = 'starting';
+        await h.command('antigravity.switchModel');
+
+        assert.deepEqual([...new Set(pm2Commands(h))], ['pm2 restart antigravity-proxy'],
+            'no machine-specific script path in the command');
+        const post = h.requests('http', '/session-model').at(-1);
+        assert.ok(post, 'the model is sent once the proxy answers');
+        assert.deepEqual(JSON.parse(post.body), {
+            model: OPUS,
+            sessionId: h.context.workspaceState.get('antigravity.windowId'),
+            name: 'test-workspace'
+        });
+        assert.equal(h.context.workspaceState.get('antigravity.windowModel'), OPUS);
+        assert.deepEqual(h.messages('error'), []);
+        assert.deepEqual(h.state.unhandledRejections, []);
+        await h.waitFor(() => h.modelItem.text === '🎭 Opus', 'model shown after the proxy came up');
+    });
+});
+
+test('offline: a proxy that never comes up gives an error message, not an unhandled rejection', async () => {
+    await withHarness({
+        globalState: ENABLED, fastTimers: true, pick: pickModel(OPUS), http: {},
+        exec: (command) => (command.startsWith('pm2') ? 'ok' : null)
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        const probesBefore = h.requests('http', '/health').length;
+
+        await h.command('antigravity.switchModel');
+        await h.settle();
+
+        assert.equal(h.requests('http', '/health').length - probesBefore, 20, 'readiness wait is bounded');
+        assert.equal(h.requests('http', '/session-model').length, 0);
+        assert.equal(h.messages('error').length, 1);
+        assert.match(h.messages('error')[0], /not responding/);
+        assert.ok(!h.messages('info').some((m) => m.includes('Proxy started')), 'no success toast');
+        assert.deepEqual(h.state.unhandledRejections, []);
+    });
+});
+
+test('offline: a PM2 failure is reported and nothing is sent to the proxy', async () => {
+    await withHarness({ globalState: ENABLED, pick: pickModel(OPUS), http: {}, exec: () => null }, async (h) => {
+        h.activate();
+        await h.settle();
+        await h.command('antigravity.switchModel');
+        assert.equal(h.messages('error').length, 1);
+        assert.match(h.messages('error')[0], /Failed to start proxy/);
+        assert.equal(h.requests('http', '/session-model').length, 0);
+    });
+});
+
+test('the pm2 start fallback uses antigravity.proxyScriptPath and rejects unsafe values', async () => {
+    await withHarness({
+        globalState: ENABLED, fastTimers: true, pick: pickModel(OPUS), http: {},
+        config: { 'antigravity.proxyScriptPath': '/opt/proxy/src/index.js' },
+        exec: () => null
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        await h.command('antigravity.switchModel');
+        assert.deepEqual([...new Set(pm2Commands(h))],
+            ['pm2 restart antigravity-proxy || pm2 start "/opt/proxy/src/index.js" --name antigravity-proxy']);
+    });
+
+    await withHarness({
+        globalState: ENABLED, pick: pickModel(OPUS), http: {},
+        config: { 'antigravity.proxyScriptPath': '/x/$(whoami).js' },
+        exec: () => 'ok'
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        await h.command('antigravity.switchModel');
+        assert.deepEqual(pm2Commands(h), [], 'nothing is executed for an unsafe path');
+        assert.match(h.messages('error')[0], /antigravity\.proxyScriptPath/);
+    });
+});
+
+test('online: a failed model switch shows an error and keeps the current model', async () => {
+    await withHarness({
+        globalState: ENABLED, pick: pickModel(OPUS),
+        http: proxyUp({ '/session-model': { status: 500, body: '' } })
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+
+        await h.command('antigravity.switchModel');     // must not reject
+
+        assert.deepEqual(h.messages('error'), ['Failed to switch model: HTTP 500']);
+        assert.equal(h.modelItem.text, '⚡ Flash');
+        assert.equal(h.context.workspaceState.get('antigravity.windowModel'), undefined);
+        assert.deepEqual(h.state.unhandledRejections, []);
+    });
+});
+
+test('online: a successful switch posts this window\'s session id and persists the model', async () => {
+    await withHarness({ globalState: ENABLED, pick: pickModel(OPUS), http: proxyUp() }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+        await h.command('antigravity.switchModel');
+
+        const post = h.requests('http', '/session-model').at(-1);
+        assert.equal(post.method, 'POST');
+        assert.deepEqual(JSON.parse(post.body), {
+            model: OPUS,
+            sessionId: h.context.workspaceState.get('antigravity.windowId'),
+            name: 'test-workspace'
+        });
+        assert.equal(h.context.workspaceState.get('antigravity.windowModel'), OPUS);
+        assert.equal(h.modelItem.text, '🎭 Opus');
+
+        // Later polls must not replace the window's own model with the proxy's global one
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.modelItem.text, '🎭 Opus');
+    });
+});
+
+test('PM2 commands run with a timeout and without a console window', async () => {
+    await withHarness({ globalState: ENABLED, pick: pickModel(OPUS), http: {}, exec: () => null }, async (h) => {
+        h.activate();           // proxy down: activation tries to start it
+        await h.settle();
+        await h.command('antigravity.switchModel');
+        const pm2Execs = h.execs('pm2');
+        assert.ok(pm2Execs.length >= 2);
+        for (const { command, options } of pm2Execs) {
+            assert.ok(options.timeout > 0, `${command} has a timeout`);
+            assert.equal(options.windowsHide, true, `${command} hides the console window`);
+        }
+    });
+});
+
+test('disabling an online proxy stops it via PM2 and reports a failure honestly', async () => {
+    for (const [pm2Result, level, pattern] of [['ok', 'info', /Proxy stopped/], [null, 'warning', /could not stop/i]]) {
+        await withHarness({
+            globalState: ENABLED, pick: pickToggle, http: proxyUp(),
+            exec: (command) => (command.startsWith('pm2') ? pm2Result : null)
+        }, async (h) => {
+            h.activate();
+            await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+            await h.command('antigravity.switchModel');
+            await h.settle();
+
+            assert.deepEqual(pm2Commands(h), ['pm2 stop antigravity-proxy']);
+            assert.equal(h.context.globalState.get('antigravity.proxyEnabled'), false);
+            assert.equal(h.modelItem.text, '$(debug-stop) Disabled');
+            assert.equal(h.quotaItem.tooltip, 'Proxy disabled');
+            assert.equal(h.messages(level).length, 1, `one ${level} message`);
+            assert.match(h.messages(level)[0], pattern);
+            assert.equal(h.messages().length, 1, 'no other message');
+        });
+    }
+});
+
+test('enabling the proxy starts it via PM2; a failure names the setting, not a Windows script', async () => {
+    await withHarness({ pick: pickToggle, http: {}, exec: () => null }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(debug-stop) Disabled');
+
+        await h.command('antigravity.switchModel');
+        await h.settle();
+
+        assert.equal(h.context.globalState.get('antigravity.proxyEnabled'), true);
+        assert.deepEqual(pm2Commands(h), ['pm2 restart antigravity-proxy']);
+        const warnings = h.messages('warning');
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /antigravity\.proxyScriptPath/);
+        assert.doesNotMatch(warnings[0], /\.bat/);
     });
 });
