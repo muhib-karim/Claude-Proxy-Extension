@@ -51,9 +51,25 @@ test('processQuotaData falls back to accounts.length when totalAccounts is absen
     assert.equal(r.totalAccounts, 3);
 });
 
-test('summarizeAccountLimits reports lowest pct and reset time per family', () => {
+test('summarizeAccountLimits reports the lowest pct per family with that model\'s reset time', () => {
+    // Sonnet (50%, no reset time) is the lowest Claude model; Opus's reset time must not be shown next to 50%
     const s = q.summarizeAccountLimits(sample.accounts[0].limits);
-    assert.deepEqual(s, { claudePct: 50, geminiPct: 100, claudeReset: '2026-01-01T05:00:00Z', geminiReset: null });
+    assert.deepEqual(s, { claudePct: 50, geminiPct: 100, claudeReset: null, geminiReset: null });
+
+    // The reset time belongs to the model with the lowest quota, not to the last model listed
+    assert.deepEqual(q.summarizeAccountLimits({
+        'claude-opus-4-5-thinking': { remainingFraction: 0.1, resetTime: '2026-01-01T01:00:00Z' },
+        'claude-sonnet-4-5-thinking': { remainingFraction: 0.9, resetTime: '2026-01-02T09:00:00Z' },
+        'gemini-3-flash': { remainingFraction: 0.4, resetTime: '2026-01-01T03:00:00Z' },
+        'gemini-3-pro-high': { remainingFraction: null, resetTime: '2026-01-05T00:00:00Z' }
+    }), { claudePct: 10, geminiPct: 40, claudeReset: '2026-01-01T01:00:00Z', geminiReset: '2026-01-01T03:00:00Z' });
+
+    // Two models tied for lowest: a known reset time is kept
+    assert.deepEqual(q.summarizeAccountLimits({
+        'claude-sonnet-4-5-thinking': { remainingFraction: 0.2 },
+        'claude-opus-4-5-thinking': { remainingFraction: 0.2, resetTime: '2026-01-01T01:00:00Z' }
+    }), { claudePct: 20, geminiPct: null, claudeReset: '2026-01-01T01:00:00Z', geminiReset: null });
+
     assert.deepEqual(q.summarizeAccountLimits(undefined), { claudePct: null, geminiPct: null, claudeReset: null, geminiReset: null });
 });
 
