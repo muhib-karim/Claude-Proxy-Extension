@@ -414,3 +414,141 @@ test('the /health response at activation is drained so the socket is released', 
         assert.deepEqual(pm2Commands(h), []);
     });
 });
+
+// ---------- B8 / B10: polling and account lookups ----------
+
+test('nothing is polled or spawned while the proxy is disabled', async () => {
+    await withHarness({
+        platform: 'win32', http: proxyUp(), https: languageServer(), exec: windowsTools()
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        h.tickIntervals();          // the 5 s proxy poll and the 60 s account poll
+        h.fireWindowState(true);
+        h.fireAuthChange();
+        await h.settle();
+
+        assert.deepEqual(h.state.requests.map((r) => `${r.kind} ${r.path}`), []);
+        assert.deepEqual(h.state.execs.map((e) => e.command), []);
+        assert.equal(h.modelItem.text, '$(debug-stop) Disabled');
+        assert.equal(h.quotaItem.tooltip, 'Proxy disabled');
+    });
+});
+
+test('on Linux and macOS no Windows tools are spawned for the account lookup', async () => {
+    for (const platform of ['linux', 'darwin']) {
+        await withHarness({ platform, globalState: ENABLED, http: proxyUp(), exec: () => null }, async (h) => {
+            h.activate();
+            await h.settle();
+            h.tickIntervals(60000);
+            h.fireWindowState(true);
+            h.fireAuthChange();
+            await h.settle();
+
+            assert.deepEqual(h.state.execs.map((e) => e.command), [], platform);
+            assert.equal(h.modelItem.text, '⚡ Flash');
+            assert.equal(h.quotaItem.text, '$(account)');
+        });
+    }
+});
+
+test('account lookups never overlap; events during a lookup cause exactly one follow-up', async () => {
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, http: proxyUp(), https: languageServer(), exec: windowsTools()
+    }, async (h) => {
+        h.activate();               // lookup #1 starts (wmic is running)
+        h.fireWindowState(true);    // three more triggers while it runs
+        h.fireWindowState(true);
+        h.fireAuthChange();
+        assert.equal(h.execs('wmic').length, 1, 'no second wmic while one is running');
+
+        await h.waitFor(() => h.execs('wmic').length === 2, 'one follow-up lookup');
+        await h.settle();
+        assert.equal(h.execs('wmic').length, 2, 'and only one');
+        assert.equal(h.quotaItem.text, '$(account) alice');
+
+        h.fireWindowState(false);   // losing focus is not a trigger
+        await h.settle();
+        assert.equal(h.execs('wmic').length, 2);
+    });
+});
+
+test('a proxy poll never overlaps the previous one', async () => {
+    await withHarness({
+        globalState: ENABLED,
+        http: proxyUp({ '/active-model': 'hold', '/account-limits': 'hold' })
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        h.tickIntervals(5000);
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.requests('http', '/active-model').length, 1);
+        assert.equal(h.requests('http', '/account-limits').length, 1);
+
+        // Once the slow answers arrive, polling carries on
+        h.release(h.requests('http', '/active-model')[0], { body: '{"model":"gemini-3-flash"}' });
+        h.release(h.requests('http', '/account-limits')[0], { body: JSON.stringify(ACCOUNT_LIMITS) });
+        await h.settle();
+        assert.equal(h.modelItem.text, '⚡ Flash');
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.requests('http', '/active-model').length, 2);
+        assert.equal(h.requests('http', '/account-limits').length, 2);
+    });
+});
+
+test('a poll that times out does not block the next poll', async () => {
+    await withHarness({
+        globalState: ENABLED,
+        http: proxyUp({ '/active-model': 'timeout', '/account-limits': 'timeout' })
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+        h.tickIntervals(5000);
+        await h.settle();
+        assert.equal(h.requests('http', '/active-model').length, 2);
+        assert.equal(h.requests('http', '/account-limits').length, 2);
+    });
+});
+
+test('enabling the proxy refreshes its state as soon as it answers', async () => {
+    await withHarness({
+        pick: pickToggle, http: proxyUp(), exec: (command) => (command.startsWith('pm2') ? 'ok' : null)
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.deepEqual(h.state.requests, []);
+
+        await h.command('antigravity.switchModel');
+        // No timer tick: the refresh must come from enabling itself
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'state refreshed after enabling');
+        await h.waitFor(() => h.requests('http', '/account-limits').length >= 1, 'quota fetched after enabling');
+    });
+});
+
+test('disabling forgets the online state, so a later enable does not show a stale model', async () => {
+    let proxyRunning = true;
+    const routes = proxyUp();
+    await withHarness({
+        globalState: ENABLED, pick: pickToggle,
+        http: (record) => (proxyRunning ? routes[record.path] : 'refuse'),
+        exec: (command) => (command === 'pm2 stop antigravity-proxy' ? 'ok' : null)
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+
+        await h.command('antigravity.switchModel');     // disable: pm2 stop
+        await h.settle();
+        proxyRunning = false;
+        assert.equal(h.modelItem.text, '$(debug-stop) Disabled');
+
+        const enabling = h.command('antigravity.switchModel');  // enable: pm2 restart fails, proxy stays down
+        await h.settle(2);
+        assert.notEqual(h.modelItem.text, '⚡ Flash', 'the stopped proxy must not look online');
+        await enabling;
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+    });
+});
