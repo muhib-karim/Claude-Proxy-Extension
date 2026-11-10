@@ -78,8 +78,10 @@ jobs:
             exit 1
           fi
 
-      # The verified build, for publishing the exact file CI checked
+      # The verified build, for publishing the exact file CI checked. A convenience only: the checks
+      # above are the gate, so a full account artifact quota must not turn the job red.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
         with:
           name: claude-proxy-status-vsix
           path: ${{ runner.temp }}/claude-proxy-status.vsix
