@@ -16,20 +16,20 @@ if (-not $token) {
     exit 1
 }
 
+# Refuse to continue if anything that must not ship (.secrets, .env*, keys, old .vsix files,
+# tests, stray folders) would end up in the package. CI runs the same check.
+Write-Host "Checking package contents..."
+npm run --silent verify:package
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Package content check failed. Nothing was packaged or published."
+    exit 1
+}
+
 # Package
-# vsce rejects SVG images in README.md, so package with the PNG render of the banner
 Write-Host "Packaging Extension..."
 $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
 $vsix = "claude-proxy-status-$version.vsix"
-$readmePath = Join-Path $PWD 'README.md'
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$readme = [System.IO.File]::ReadAllText($readmePath, $utf8)
-try {
-    [System.IO.File]::WriteAllText($readmePath, $readme.Replace('docs/banner.svg', 'docs/banner.png'), $utf8)
-    npx -y @vscode/vsce package --out $vsix
-} finally {
-    [System.IO.File]::WriteAllText($readmePath, $readme, $utf8)
-}
+npx -y @vscode/vsce@4.1.0 package --out $vsix
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Packaging failed."
     exit 1

@@ -1,12 +1,15 @@
-.vscode/**
-.vscode-test/**
-.github/**
-node_modules/**
-test/**
-docs/**
-*.log
-.gitignore
-.env
-eslint.config.js
-publish.ps1
-screenshot-*.png
+# Allowlist: everything in the working tree stays out of the VSIX unless it is re-included below.
+# Local files (.secrets, .env*, keys, old *.vsix builds, scratch folders), tests, docs, scripts and
+# screenshots can therefore never ship by accident. README images are loaded from GitHub.
+#
+# vsce lets a re-include (!pattern) win over every exclude, so keep each one narrow.
+# `npm run verify:package` and the CI "package" job fail if anything else gets into the package.
+**
+
+!extension.js
+!lib/*.js
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!icon.png

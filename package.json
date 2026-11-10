@@ -31,7 +31,9 @@
     "scripts": {
         "lint": "eslint .",
         "test": "node --test test/quota.test.js test/pm2.test.js test/extension.test.js test/extension.behavior.test.js test/package-files.test.js",
-        "check": "npm run lint && npm test"
+        "check": "npm run lint && npm test",
+        "verify:package": "npx --yes @vscode/vsce@4.1.0 ls | node scripts/check-vsix-files.js",
+        "package": "npx --yes @vscode/vsce@4.1.0 package"
     },
     "contributes": {
         "commands": [

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.svg" alt="Claude Proxy Extension banner" width="100%">
+  <img src="docs/banner.png" alt="Claude Proxy Extension banner" width="100%">
 </p>
 
 <p align="center"><b>Per-window model switching and live quota monitoring for a local Claude / Gemini proxy, right in the VS Code status bar.</b></p>
