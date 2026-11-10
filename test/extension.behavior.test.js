@@ -552,3 +552,128 @@ test('disabling forgets the online state, so a later enable does not show a stal
         assert.equal(h.modelItem.text, '$(warning) Offline');
     });
 });
+
+// ---------- B11: what counts as "online" ----------
+
+test('an answer on port 8080 that is not HTTP 200 does not count as the proxy being online', async () => {
+    await withHarness({
+        globalState: ENABLED,
+        http: {
+            '/health': { body: '{}' },
+            '/active-model': { status: 404, body: '{"error":"not found"}' },
+            '/account-limits': { status: 404, body: '{"error":"not found"}' }
+        }
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.modelItem.text, '$(warning) Offline');
+        assert.equal(h.quotaItem.text, '$(account) Offline');
+    });
+});
+
+test('a non-string model reported by the proxy is ignored', async () => {
+    await withHarness({
+        globalState: ENABLED, http: proxyUp({ '/active-model': { body: '{"model":{"id":1}}' } })
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.equal(h.modelItem.text, 'unknown', 'online, but no model adopted');
+        assert.doesNotMatch(String(h.modelItem.tooltip), /\[object/);
+    });
+});
+
+// ---------- B13: quota popup states ----------
+
+const popupLabels = async (h) => {
+    await h.command('antigravity.showQuotaInfo');
+    return h.state.quickPicks.at(-1).items.map((i) => i.label);
+};
+
+test('the quota popup says why there is no data instead of loading forever', async () => {
+    await withHarness({ http: proxyUp() }, async (h) => {          // disabled
+        h.activate();
+        await h.settle();
+        const labels = await popupLabels(h);
+        assert.ok(labels.some((l) => l.includes('Proxy disabled')), labels.join(' | '));
+        assert.ok(!labels.some((l) => l.includes('Loading')));
+    });
+    await withHarness({ globalState: ENABLED, http: {} }, async (h) => {   // enabled, proxy down
+        h.activate();
+        await h.settle();
+        const labels = await popupLabels(h);
+        assert.ok(labels.some((l) => l.includes('Proxy offline')), labels.join(' | '));
+        assert.ok(!labels.some((l) => l.includes('Loading')));
+    });
+    await withHarness({                                             // online, quota still on its way
+        globalState: ENABLED, http: proxyUp({ '/account-limits': 'hold' })
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        assert.ok((await popupLabels(h)).some((l) => l.includes('Loading quota data')));
+    });
+    await withHarness({ globalState: ENABLED, http: proxyUp() }, async (h) => {   // online with data
+        h.activate();
+        await h.settle();
+        const labels = await popupLabels(h);
+        assert.ok(labels.includes('🟠 Claude: ▰▰▱▱▱▱▱▱▱▱ 20%'), labels.join(' | '));
+        assert.ok(labels.includes('💎 Gemini: ▰▰▰▰▰▱▱▱▱▱ 50%'));
+        assert.deepEqual(labels.filter((l) => l.startsWith('👤')), ['👤 beta', '👤 alpha']);
+    });
+});
+
+// ---------- B14: nothing happens after deactivation ----------
+
+test('a model switch answered after deactivation shows nothing and touches no UI', async () => {
+    await withHarness({
+        globalState: ENABLED, pick: pickModel(OPUS), http: proxyUp({ '/session-model': 'hold' })
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.modelItem.text === '⚡ Flash', 'proxy online');
+        const pending = h.command('antigravity.switchModel');
+        await h.waitFor(() => h.requests('http', '/session-model').length === 1, 'switch request sent');
+
+        h.shutdown();
+        const item = h.state.statusBarItems.find((i) => i.command === 'antigravity.switchModel');
+        const textAtShutdown = item.text;
+        h.release(h.requests('http', '/session-model')[0], { body: '{"ok":true}' });
+        await pending;
+        await h.settle();
+
+        assert.deepEqual(h.messages(), []);
+        assert.equal(item.text, textAtShutdown);
+    });
+});
+
+test('deactivating during the readiness wait ends it without a message', async () => {
+    await withHarness({
+        globalState: ENABLED, pick: pickModel(OPUS),
+        http: { '/health': 'hold' },                                 // the proxy never answers the probe
+        exec: (command) => (command.startsWith('pm2') ? 'ok' : null)
+    }, async (h) => {
+        h.activate();
+        await h.settle();
+        const pending = h.command('antigravity.switchModel');
+        await h.waitFor(() => h.requests('http', '/health').length === 2, 'first readiness probe');
+
+        h.shutdown();
+        for (const probe of h.requests('http', '/health')) h.release(probe, 'refuse');
+        await pending;
+        await h.settle();
+
+        assert.equal(h.requests('http', '/health').length, 2, 'no further probes after deactivation');
+        assert.deepEqual(h.messages(), []);
+    });
+});
+
+// ---------- B16: privacy ----------
+
+test('the signed-in e-mail address is not written to the log', async () => {
+    await withHarness({
+        platform: 'win32', globalState: ENABLED, http: proxyUp(), https: languageServer(), exec: windowsTools()
+    }, async (h) => {
+        h.activate();
+        await h.waitFor(() => h.quotaItem.text === '$(account) alice', 'account found');
+        assert.ok(h.state.logs.some((l) => l.includes('Found Antigravity account')));
+        assert.deepEqual(h.state.logs.filter((l) => l.includes('alice@example.com')), []);
+    });
+});

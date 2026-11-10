@@ -441,14 +441,7 @@ function activate(context) {
     //     })
     // );
 
-    context.subscriptions.push({
-        dispose: () => {
-            isDisposed = true;
-            if (pollInterval) clearInterval(pollInterval);
-            if (accountPollInterval) clearInterval(accountPollInterval);
-            if (settingsWatcher) settingsWatcher.close();
-        }
-    });
+    context.subscriptions.push({ dispose: shutdown });
 }
 
 // ==================== QUOTA STATUS BAR ====================
@@ -489,7 +482,11 @@ async function showQuotaQuickPick() {
         kind: vscode.QuickPickItemKind.Separator
     });
 
-    if (!proxyQuotaData) {
+    if (!isProxyEnabled) {
+        items.push({ label: '$(debug-stop) Proxy disabled', description: 'Enable it from the model menu to see quotas' });
+    } else if (!isProxyOnline) {
+        items.push({ label: '$(warning) Proxy offline', description: 'No quota data available' });
+    } else if (!proxyQuotaData) {
         items.push({ label: '$(sync~spin) Loading quota data...', description: '' });
     } else {
         // Claude quota
@@ -621,7 +618,7 @@ async function lookupIDEAccount() {
             continue;   // Try next port (only request failures are ignored here)
         }
         if (userStatus && userStatus.email) {
-            console.log(`[Claude Proxy] Found Antigravity account: ${userStatus.email}`);
+            console.log('[Claude Proxy] Found Antigravity account');   // the address itself stays out of the log
             return {
                 provider: 'antigravity',
                 email: userStatus.email,
@@ -763,6 +760,10 @@ function fetchProxyQuotaData() {
         res.on('end', () => {
             done();
             if (isDisposed || !isProxyEnabled) return;  // answer arrived after a disable/deactivate
+            if (res.statusCode !== 200) {
+                console.log(`[Claude Proxy] /account-limits answered HTTP ${res.statusCode}; keeping previous quota data`);
+                return;
+            }
             try {
                 const json = JSON.parse(data);
                 proxyQuotaData = processQuotaData(json);
@@ -844,20 +845,24 @@ function checkProxyHealth() {
 
             // Only the parse is guarded: an exception in the status bar code below must never be
             // mistaken for "the proxy is down"
+            // Anything other than HTTP 200 with a JSON object is not our proxy answering normally
+            // (another tool may be listening on 8080)
             let json = null;
-            try {
-                json = JSON.parse(data);
-            } catch (e) {
-                json = null;
+            if (res.statusCode === 200) {
+                try {
+                    json = JSON.parse(data);
+                } catch (e) {
+                    json = null;
+                }
             }
-            if (!json) {
+            if (!json || typeof json !== 'object') {
                 setOnline(false);
                 return;
             }
 
             // Only accept proxy model on FIRST connect if no local model saved
             // This prevents multiple windows from overwriting each other's model
-            if (json.model && json.model !== currentModel) {
+            if (typeof json.model === 'string' && json.model && json.model !== currentModel) {
                 const hasSavedModel = extensionContext && extensionContext.workspaceState.get(WINDOW_MODEL_KEY);
                 if (isFirstConnect && !hasSavedModel) {
                     console.log(`[Claude Proxy] First connect - using proxy model: ${json.model}`);
@@ -904,13 +909,16 @@ function setModelOnProxy(model) {
             readBody(res).then((data) => {
                 if (res.statusCode === 200) {
                     currentModel = model;
-                    // Save to workspaceState for per-window persistence
+                    // Save to workspaceState for per-window persistence (also when the window is
+                    // closing: the proxy has accepted the model, so the saved state must match)
                     if (extensionContext) {
                         extensionContext.workspaceState.update(WINDOW_MODEL_KEY, model);
                         console.log(`[Claude Proxy] Saved session model: ${windowId.slice(0, 8)} -> ${model}`);
                     }
-                    updateModelStatusBar();
-                    vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
+                    if (!isDisposed) {
+                        updateModelStatusBar();
+                        vscode.window.showInformationMessage(`🧠 Model: ${getDisplayName(model)} (this window)`);
+                    }
                     resolve();
                 } else {
                     console.log(`[Claude Proxy] /session-model answered HTTP ${res.statusCode}: ${String(data).slice(0, 200)}`);
@@ -950,10 +958,30 @@ function updateModelStatusBar() {
 
 // ==================== DEACTIVATION ====================
 
-function deactivate() {
-    isDisposed = true;
+function clearTimers() {
     if (pollInterval) clearInterval(pollInterval);
     if (accountPollInterval) clearInterval(accountPollInterval);
+    pollInterval = null;
+    accountPollInterval = null;
+}
+
+// Runs from deactivate() and again when the subscriptions are disposed; safe to call twice.
+// Requests and timers that are still in flight see isDisposed and leave the UI and the user alone.
+function shutdown() {
+    isDisposed = true;
+    modelStartGeneration++;     // cancels a pending "start the proxy, then set the model"
+    clearTimers();
+    if (settingsWatcher) {
+        settingsWatcher.close();
+        settingsWatcher = null;
+    }
+    // The items themselves are disposed by VS Code (they are in context.subscriptions)
+    quotaStatusBarItem = null;
+    modelStatusBarItem = null;
+}
+
+function deactivate() {
+    shutdown();
     console.log('[Claude Proxy] Extension deactivated');
 }
 
