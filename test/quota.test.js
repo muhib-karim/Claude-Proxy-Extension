@@ -127,6 +127,31 @@ test('parseWmicOutput extracts pid and csrf token from list-format output', () =
     assert.equal(q.parseWmicOutput('CommandLine=x --csrf_token=t\r\nProcessId=7\r\n').csrfToken, 't');
 });
 
+test('parseWmicOutput keeps records apart when wmic ends lines with CR CR LF', () => {
+    // Real `wmic ... /format:list` output piped to Node uses "\r\r\n" line endings
+    const serverLine = 'CommandLine=C:\\ag\\language_server_windows_x64.exe --csrf_token first-tok';
+    const raw = [
+        '', serverLine, 'ProcessId=10', '', '',
+        'CommandLine=C:\\tools\\lua-language-server.exe --stdio', 'ProcessId=20', ''
+    ].join('\r\r\n');
+    assert.deepEqual(q.parseWmicOutput(raw), {
+        pid: 10,
+        csrfToken: 'first-tok',
+        commandLine: serverLine.substring('CommandLine='.length)
+    });
+
+    // Two token-bearing servers: the pid and the token must come from the same record
+    const two = [
+        '', 'CommandLine=C:\\ag\\language_server_windows_x64.exe --csrf_token tok-A', 'ProcessId=10', '', '',
+        'CommandLine=C:\\ag\\language_server_windows_x64.exe --csrf_token tok-B', 'ProcessId=20', ''
+    ].join('\r\r\n');
+    const first = q.parseWmicOutput(two);
+    assert.deepEqual({ pid: first.pid, csrfToken: first.csrfToken }, { pid: 10, csrfToken: 'tok-A' });
+
+    assert.equal(q.parseWmicOutput('CommandLine=x.exe --csrf_token=tok\nProcessId=7').csrfToken, 'tok');
+    assert.equal(q.parseWmicOutput('\r\r\n\r\r\n'), null);
+});
+
 test('parseNetstatPorts returns sorted unique listening ports (IPv4 and IPv6)', () => {
     const out = [
         '  TCP    127.0.0.1:53021        0.0.0.0:0              LISTENING       4242',
